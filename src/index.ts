@@ -9,11 +9,37 @@ type ImageBody = {
   prompt: string;
   model: string;
   ratio: string;
-  size: string;
+  size?: string;
+  quality?: 'low' | 'medium' | 'high' | 'auto';
   background: 'auto' | 'transparent';
   output_format: 'png' | 'jpeg' | 'webp';
   n: number;
   reference_image?: string;
+};
+
+type ImageItem = {
+  b64_json?: string;
+  url?: string;
+  image_url?: string;
+  image?: string;
+  revised_prompt?: string;
+};
+
+type ImageResponse = {
+  data?: ImageItem[];
+  b64_json?: string;
+  image?: string;
+  images?: string[];
+  url?: string;
+  output?: Array<{
+    type?: string;
+    result?: string;
+    b64_json?: string;
+    url?: string;
+    content?: Array<{ type?: string; image_url?: string; url?: string; b64_json?: string }>;
+  }>;
+  partial_image_b64?: string;
+  partial_image_index?: number;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -32,8 +58,10 @@ app.post('/api/generate', async (c) => {
   const normalizedBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
   const useEdit = Boolean(body.reference_image);
   const url = new URL(useEdit ? '/v1/images/edits' : '/v1/images/generations', normalizedBase);
-  const requestSize = resolveSize(body.size || '1K', body.ratio || '1:1');
-  const requestModel = resolveModel(body.model || 'gpt-image-2', body.size || '1K');
+  const requestModel = body.model || 'gpt-image-2';
+  const requestSize = resolveSize(body.ratio || '1:1');
+  const requestQuality = resolveQuality(body.quality || body.size || 'auto');
+  const requestPrompt = withRatioHint(body.prompt, body.ratio || '1:1');
 
   let upstream: Response;
   try {
@@ -41,9 +69,10 @@ app.post('/api/generate', async (c) => {
       const form = new FormData();
       const image = await dataUrlToFile(body.reference_image, 'reference.png');
       form.append('image[]', image);
-      form.append('prompt', body.prompt);
+      form.append('prompt', requestPrompt);
       form.append('model', requestModel);
       form.append('size', requestSize);
+      form.append('quality', requestQuality);
       form.append('background', normalizeBackground(body));
       form.append('output_format', body.output_format || 'png');
       form.append('n', String(body.n || 1));
@@ -62,11 +91,14 @@ app.post('/api/generate', async (c) => {
         },
         body: JSON.stringify({
           model: requestModel,
-          prompt: body.prompt,
+          prompt: requestPrompt,
           size: requestSize,
+          quality: requestQuality,
           background: normalizeBackground(body),
           output_format: body.output_format || 'png',
           n: body.n || 1,
+          stream: true,
+          partial_images: 2,
         }),
       });
     }
@@ -77,23 +109,19 @@ app.post('/api/generate', async (c) => {
     }, 502);
   }
 
-  const text = await upstream.text();
-  if (!upstream.ok) {
-    return new Response(JSON.stringify({
-      error: extractUpstreamError(text),
-      upstream_status: upstream.status,
-    }), {
-      status: upstream.status,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
+  if (!upstream.ok) return upstreamErrorResponse(upstream, await upstream.text());
+  if (!useEdit && isEventStream(upstream)) return streamImageEvents(upstream, body.output_format || 'png');
 
-  const data = JSON.parse(text) as { data?: Array<{ b64_json?: string; revised_prompt?: string }> };
-  const images = (data.data || [])
-    .map((item) => item.b64_json)
-    .filter((image): image is string => Boolean(image))
-    .map((image) => `data:image/${body.output_format || 'png'};base64,${image}`);
-  if (!images.length) return c.json({ error: 'No image returned' }, 502);
+  const text = await upstream.text();
+
+  const data = JSON.parse(text) as ImageResponse;
+  const images = extractImages(data, body.output_format || 'png');
+  if (!images.length) {
+    return c.json({
+      error: 'No image returned',
+      detail: summarizeImageResponse(data),
+    }, 502);
+  }
 
   return c.json({ image: images[0], images });
 });
@@ -113,9 +141,112 @@ function normalizeBackground(body: ImageBody) {
   return body.background || 'auto';
 }
 
-function resolveModel(model: string, tier: string) {
-  if (model === 'gpt-image-2' && tier === '2K') return 'gpt-image-2-2k';
-  return model;
+function upstreamErrorResponse(upstream: Response, text: string) {
+  return new Response(JSON.stringify({
+    error: extractUpstreamError(text),
+    upstream_status: upstream.status,
+  }), {
+    status: upstream.status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function isEventStream(response: Response) {
+  return response.headers.get('Content-Type')?.includes('text/event-stream');
+}
+
+function streamImageEvents(upstream: Response, format: string) {
+  if (!upstream.body) return Response.json({ error: 'Upstream stream is empty' }, { status: 502 });
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const reader = upstream.body.getReader();
+  let buffer = '';
+  const streamImages: string[] = [];
+  const seenEvents: string[] = [];
+
+  const body = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+
+      send('status', { message: '图片生成请求已开始，正在等待模型返回...' });
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const chunks = buffer.split(/\n\n+/);
+          buffer = chunks.pop() || '';
+          for (const chunk of chunks) {
+            const parsed = parseSseChunk(chunk);
+            if (!parsed.data) continue;
+            const event = parseJson(parsed.data);
+            if (!event) continue;
+            const type = event?.type || parsed.event;
+            if (type && !seenEvents.includes(type)) seenEvents.push(type);
+            const images = extractImages(event, format);
+            if (images.length) streamImages.push(...images);
+
+            if (type === 'image_generation.partial_image' && event?.b64_json) {
+              send('partial', {
+                image: asDataUrl(event.b64_json, format),
+                index: event.partial_image_index || 0,
+              });
+            }
+            if (type === 'image_generation.completed') {
+              if (streamImages.length) send('done', { images: unique(streamImages) });
+              else send('error', {
+                error: '上游返回了完成事件，但事件里没有图片数据。',
+                detail: summarizeStreamEvents(seenEvents, event),
+              });
+              return;
+            }
+          }
+        }
+
+        if (streamImages.length) send('done', { images: unique(streamImages) });
+        else send('error', {
+          error: '上游流式响应结束，但没有返回最终图片。',
+          detail: { event_types: seenEvents },
+        });
+      } catch (error) {
+        send('error', { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        controller.close();
+      }
+    },
+    cancel() {
+      reader.cancel().catch(() => undefined);
+    },
+  });
+
+  return new Response(body, {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    },
+  });
+}
+
+function parseSseChunk(chunk: string) {
+  const result = { event: '', data: '' };
+  for (const line of chunk.split(/\r?\n/)) {
+    if (line.startsWith('event:')) result.event = line.slice(6).trim();
+    if (line.startsWith('data:')) result.data += line.slice(5).trim();
+  }
+  return result;
+}
+
+function parseJson(value: string) {
+  try {
+    return JSON.parse(value) as Record<string, any>;
+  } catch {
+    return null;
+  }
 }
 
 function extractUpstreamError(text: string) {
@@ -128,6 +259,69 @@ function extractUpstreamError(text: string) {
   }
 }
 
+function extractImages(data: ImageResponse, format: string) {
+  const values: string[] = [];
+
+  if (data.b64_json) values.push(asDataUrl(data.b64_json, format));
+  if (data.partial_image_b64) values.push(asDataUrl(data.partial_image_b64, format));
+  for (const value of data.images || []) values.push(value);
+  if (data.image) values.push(data.image);
+  if (data.url) values.push(data.url);
+
+  for (const item of data.data || []) {
+    if (item.b64_json) values.push(asDataUrl(item.b64_json, format));
+    if (item.url) values.push(item.url);
+    if (item.image_url) values.push(item.image_url);
+    if (item.image) values.push(normalizeImageValue(item.image, format));
+  }
+
+  for (const item of data.output || []) {
+    if (item.result) values.push(normalizeImageValue(item.result, format));
+    if (item.b64_json) values.push(asDataUrl(item.b64_json, format));
+    if (item.url) values.push(item.url);
+    for (const content of item.content || []) {
+      if (content.b64_json) values.push(asDataUrl(content.b64_json, format));
+      if (content.image_url) values.push(content.image_url);
+      if (content.url) values.push(content.url);
+    }
+  }
+
+  return values
+    .map((value) => normalizeImageValue(value, format))
+    .filter((value, index, list) => Boolean(value) && list.indexOf(value) === index);
+}
+
+function unique(values: string[]) {
+  return values.filter((value, index, list) => Boolean(value) && list.indexOf(value) === index);
+}
+
+function normalizeImageValue(value: string, format: string) {
+  if (!value) return '';
+  if (value.startsWith('data:image/') || value.startsWith('http://') || value.startsWith('https://')) return value;
+  return asDataUrl(value, format);
+}
+
+function asDataUrl(value: string, format: string) {
+  return `data:image/${format};base64,${value}`;
+}
+
+function summarizeImageResponse(data: ImageResponse) {
+  return {
+    top_level_keys: Object.keys(data),
+    data_count: data.data?.length || 0,
+    data_keys: data.data?.[0] ? Object.keys(data.data[0]) : [],
+    output_count: data.output?.length || 0,
+    output_keys: data.output?.[0] ? Object.keys(data.output[0]) : [],
+  };
+}
+
+function summarizeStreamEvents(eventTypes: string[], lastEvent: Record<string, any>) {
+  return {
+    event_types: eventTypes,
+    last_event_keys: Object.keys(lastEvent || {}),
+  };
+}
+
 async function dataUrlToFile(dataUrl: string, filename: string) {
   const match = /^data:(.+?);base64,(.+)$/.exec(dataUrl);
   if (!match) throw new Error('Invalid reference image');
@@ -136,32 +330,26 @@ async function dataUrlToFile(dataUrl: string, filename: string) {
   return new File([bytes], filename, { type: mimeType });
 }
 
-function resolveSize(tier: string, ratio: string) {
-  const sizes: Record<string, Record<string, string>> = {
-    '1K': {
-      unspecified: 'auto',
-      '1:1': '1024x1024',
-      '16:9': '1536x864',
-      '4:3': '1536x1152',
-      '3:4': '1152x1536',
-      '9:16': '864x1536',
-    },
-    '2K': {
-      unspecified: 'auto',
-      '1:1': '2048x2048',
-      '16:9': '2048x1152',
-      '4:3': '2048x1536',
-      '3:4': '1536x2048',
-      '9:16': '1152x2048',
-    },
-    '4K': {
-      unspecified: 'auto',
-      '1:1': '2048x2048',
-      '16:9': '3840x2160',
-      '4:3': '2880x2160',
-      '3:4': '2160x2880',
-      '9:16': '2160x3840',
-    },
+function withRatioHint(prompt: string, ratio: string) {
+  if (ratio === '1:1' || ratio === 'unspecified') return prompt;
+  const ratioLabels: Record<string, string> = {
+    '16:9': '16:9 横版画幅',
+    '4:3': '4:3 横版画幅',
+    '3:4': '3:4 竖版画幅',
+    '9:16': '9:16 竖版画幅',
   };
-  return sizes[tier]?.[ratio] || '1024x1024';
+  return `${prompt}\n\n画面比例要求：${ratioLabels[ratio] || ratio}。`;
+}
+
+function resolveSize(ratio: string) {
+  if (ratio === 'unspecified') return 'auto';
+  if (ratio === '3:4' || ratio === '9:16') return '1024x1536';
+  if (ratio === '16:9' || ratio === '4:3') return '1536x1024';
+  return '1024x1024';
+}
+
+function resolveQuality(value: string) {
+  const legacyMap: Record<string, string> = { '1K': 'auto', '2K': 'high', '4K': 'high' };
+  const quality = legacyMap[value] || value || 'auto';
+  return ['low', 'medium', 'high', 'auto'].includes(quality) ? quality : 'auto';
 }

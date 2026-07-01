@@ -55,7 +55,7 @@
           <div class="summary-tags">
             <span>模型 <b id="modelTag">gpt-image-2</b></span>
             <span id="ratioTag">1:1（正方形）</span>
-            <span id="sizeTag">1K</span>
+            <span id="sizeTag">自动清晰度</span>
             <span id="bgTag">自动背景</span>
             <span id="fmtTag">PNG</span>
             <span>张数 <b id="countTag">1</b></span>
@@ -109,16 +109,16 @@
               <label class="field">
                 <span>清晰度</span>
                 <select id="size">
-                  <option value="1K" selected>1K</option>
-                  <option value="2K">2K</option>
-                  <option value="4K">4K</option>
+                  <option value="auto" selected>自动</option>
+                  <option value="low">低</option>
+                  <option value="medium">中</option>
+                  <option value="high">高</option>
                 </select>
               </label>
               <label class="field">
                 <span>模型</span>
                 <select id="model">
                   <option value="gpt-image-2" selected>gpt-image-2</option>
-                  <option value="gpt-image-2-2k">gpt-image-2-2k</option>
                   <option value="gpt-image-1.5">gpt-image-1.5</option>
                   <option value="gpt-image-1">gpt-image-1</option>
                 </select>

@@ -145,7 +145,7 @@ function applySessionToForm(session) {
   els.prompt.value = session?.prompt || '';
   if (session?.settings) {
     els.ratio.value = session.settings.ratio || '1:1';
-    els.size.value = session.settings.size || '1K';
+    els.size.value = normalizeQuality(session.settings.quality || session.settings.size || 'auto');
     els.model.value = session.settings.model || 'gpt-image-2';
     els.background.value = session.settings.background || 'auto';
     els.format.value = session.settings.output_format || 'png';
@@ -161,7 +161,7 @@ function readSettings() {
   return {
     model: els.model.value,
     ratio: els.ratio.value,
-    size: els.size.value,
+    quality: normalizeQuality(els.size.value),
     background: els.background.value,
     output_format: els.format.value,
     n: Math.max(1, Math.min(4, Number(els.count.value || 1))),
@@ -169,12 +169,15 @@ function readSettings() {
 }
 
 function reconcileModelSize() {
-  if (els.size.value === '2K' && els.model.value === 'gpt-image-2') {
-    els.model.value = 'gpt-image-2-2k';
-  }
-  if (els.size.value === '1K' && els.model.value === 'gpt-image-2-2k') {
+  if (els.model.value === 'gpt-image-2-2k') {
     els.model.value = 'gpt-image-2';
   }
+}
+
+function normalizeQuality(value) {
+  const legacyMap = { '1K': 'auto', '2K': 'high', '4K': 'high' };
+  const normalized = legacyMap[value] || value || 'auto';
+  return ['low', 'medium', 'high', 'auto'].includes(normalized) ? normalized : 'auto';
 }
 
 function render() {
@@ -268,7 +271,7 @@ function clearStageStatus() {
 function updateTags() {
   els.modelTag.textContent = els.model.value;
   els.ratioTag.textContent = labels.ratio[els.ratio.value] || els.ratio.value;
-  els.sizeTag.textContent = els.size.value;
+  els.sizeTag.textContent = ({ low: '低清晰度', medium: '中清晰度', high: '高清晰度', auto: '自动清晰度' })[normalizeQuality(els.size.value)] || '自动清晰度';
   els.bgTag.textContent = labels.bg[els.background.value] || els.background.value;
   els.fmtTag.textContent = labels.fmt[els.format.value] || els.format.value;
   els.countTag.textContent = String(Math.max(1, Math.min(4, Number(els.count.value || 1))));
@@ -307,7 +310,16 @@ async function sendPrompt() {
       },
       body: JSON.stringify(body),
     });
+    if (res.headers.get('Content-Type')?.includes('text/event-stream')) {
+      const data = await readImageStream(res, prompt);
+      clearStageStatus();
+      updateActiveSession({ prompt, images: data.images });
+      els.statusLine.textContent = '生成完成';
+      toast('图片生成完成');
+      return;
+    }
     const data = await readApiResponse(res);
+    if (!res.ok && data.detail) console.warn('Image API detail:', data.detail);
     if (!res.ok) throw new Error(formatApiError(res.status, data.error || data.message || '生成失败'));
     clearStageStatus();
     updateActiveSession({ prompt, images: data.images || [data.image].filter(Boolean) });
@@ -326,6 +338,67 @@ async function sendPrompt() {
   }
 }
 
+async function readImageStream(res, prompt) {
+  if (!res.ok) {
+    const data = await readApiResponse(res);
+    throw new Error(formatApiError(res.status, data.error || data.message || '生成失败'));
+  }
+  if (!res.body) throw new Error('浏览器没有收到图片生成流。');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const images = [];
+  let buffer = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split(/\n\n+/);
+    buffer = chunks.pop() || '';
+    for (const chunk of chunks) {
+      const event = parseSseChunk(chunk);
+      if (!event.data) continue;
+      const data = parseJson(event.data);
+      if (event.event === 'status') {
+        setStageStatus('loading', '正在生成图片', data.message || '模型正在处理，请保持页面打开。', '…');
+      }
+      if (event.event === 'partial' && data.image) {
+        images[data.index || 0] = data.image;
+        updateActiveSession({ prompt, images: images.filter(Boolean) });
+        setStageStatus('loading', '收到部分图片', '模型还在继续完善图片，请稍等最终结果。', '…');
+      }
+      if (event.event === 'done') {
+        return { images: data.images || images.filter(Boolean) };
+      }
+      if (event.event === 'error') {
+        if (data.detail) console.warn('Image stream detail:', data.detail);
+        throw new Error(data.error || '图片生成失败');
+      }
+    }
+  }
+
+  if (images.length) return { images: images.filter(Boolean) };
+  throw new Error('图片生成流结束，但没有收到图片。');
+}
+
+function parseSseChunk(chunk) {
+  const result = { event: '', data: '' };
+  for (const line of chunk.split(/\r?\n/)) {
+    if (line.startsWith('event:')) result.event = line.slice(6).trim();
+    if (line.startsWith('data:')) result.data += line.slice(5).trim();
+  }
+  return result;
+}
+
+function parseJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+
 async function readApiResponse(res) {
   const text = await res.text();
   if (!text) return {};
@@ -339,7 +412,7 @@ async function readApiResponse(res) {
 function formatApiError(status, errorText) {
   const message = extractError(errorText);
   if (status === 504) {
-    return '上游接口超时（504）：HaHaCode 或其后面的图片模型没有在网关等待时间内返回。建议先用 1K、张数 1 重试，或稍后再试。';
+    return '上游接口超时（504）：HaHaCode 或其后面的图片模型没有在网关等待时间内返回。建议先用自动清晰度、张数 1 重试，或稍后再试。';
   }
   if (status === 429) return `请求过于频繁或额度不足（429）：${message}`;
   if (status >= 500) return `上游接口异常（${status}）：${message}`;
