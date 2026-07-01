@@ -33,45 +33,56 @@ app.post('/api/generate', async (c) => {
   const useEdit = Boolean(body.reference_image);
   const url = new URL(useEdit ? '/v1/images/edits' : '/v1/images/generations', normalizedBase);
   const requestSize = resolveSize(body.size || '1K', body.ratio || '1:1');
+  const requestModel = resolveModel(body.model || 'gpt-image-2', body.size || '1K');
 
   let upstream: Response;
-  if (useEdit && body.reference_image) {
-    const form = new FormData();
-    const image = await dataUrlToFile(body.reference_image, 'reference.png');
-    form.append('image[]', image);
-    form.append('prompt', body.prompt);
-    form.append('model', body.model || 'gpt-image-2');
-    form.append('size', requestSize);
-    form.append('background', normalizeBackground(body));
-    form.append('output_format', body.output_format || 'png');
-    form.append('n', String(body.n || 1));
+  try {
+    if (useEdit && body.reference_image) {
+      const form = new FormData();
+      const image = await dataUrlToFile(body.reference_image, 'reference.png');
+      form.append('image[]', image);
+      form.append('prompt', body.prompt);
+      form.append('model', requestModel);
+      form.append('size', requestSize);
+      form.append('background', normalizeBackground(body));
+      form.append('output_format', body.output_format || 'png');
+      form.append('n', String(body.n || 1));
 
-    upstream = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}` },
-      body: form,
-    });
-  } else {
-    upstream = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: body.model || 'gpt-image-2',
-        prompt: body.prompt,
-        size: requestSize,
-        background: normalizeBackground(body),
-        output_format: body.output_format || 'png',
-        n: body.n || 1,
-      }),
-    });
+      upstream = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: form,
+      });
+    } else {
+      upstream = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: requestModel,
+          prompt: body.prompt,
+          size: requestSize,
+          background: normalizeBackground(body),
+          output_format: body.output_format || 'png',
+          n: body.n || 1,
+        }),
+      });
+    }
+  } catch (error) {
+    return c.json({
+      error: 'Failed to reach upstream image API',
+      detail: error instanceof Error ? error.message : String(error),
+    }, 502);
   }
 
   const text = await upstream.text();
   if (!upstream.ok) {
-    return new Response(JSON.stringify({ error: text }), {
+    return new Response(JSON.stringify({
+      error: extractUpstreamError(text),
+      upstream_status: upstream.status,
+    }), {
       status: upstream.status,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -100,6 +111,21 @@ export default {
 function normalizeBackground(body: ImageBody) {
   if (body.background === 'transparent' && body.model === 'gpt-image-2') return 'auto';
   return body.background || 'auto';
+}
+
+function resolveModel(model: string, tier: string) {
+  if (model === 'gpt-image-2' && tier === '2K') return 'gpt-image-2-2k';
+  return model;
+}
+
+function extractUpstreamError(text: string) {
+  try {
+    const data = JSON.parse(text) as { error?: { message?: string } | string; message?: string };
+    if (typeof data.error === 'string') return data.error;
+    return data.error?.message || data.message || text;
+  } catch {
+    return text || 'Upstream image API failed';
+  }
 }
 
 async function dataUrlToFile(dataUrl: string, filename: string) {

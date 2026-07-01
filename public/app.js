@@ -9,6 +9,7 @@ const state = {
   referenceImage: '',
   busy: false,
   apiKey: '',
+  stageStatus: null,
 };
 
 const els = {
@@ -150,11 +151,13 @@ function applySessionToForm(session) {
     els.format.value = session.settings.output_format || 'png';
     els.count.value = session.settings.n || 1;
   }
+  reconcileModelSize();
   updateTags();
   updateSendState();
 }
 
 function readSettings() {
+  reconcileModelSize();
   return {
     model: els.model.value,
     ratio: els.ratio.value,
@@ -163,6 +166,15 @@ function readSettings() {
     output_format: els.format.value,
     n: Math.max(1, Math.min(4, Number(els.count.value || 1))),
   };
+}
+
+function reconcileModelSize() {
+  if (els.size.value === '2K' && els.model.value === 'gpt-image-2') {
+    els.model.value = 'gpt-image-2-2k';
+  }
+  if (els.size.value === '1K' && els.model.value === 'gpt-image-2-2k') {
+    els.model.value = 'gpt-image-2';
+  }
 }
 
 function render() {
@@ -210,9 +222,14 @@ function renderSessions() {
 function renderStage() {
   const session = activeSession();
   const images = session?.images || [];
-  els.emptyState.style.display = images.length ? 'none' : 'block';
+  const notice = state.stageStatus;
+  const showNotice = Boolean(notice) || !images.length;
+  els.emptyState.style.display = showNotice ? 'block' : 'none';
+  els.emptyState.className = `empty-state ${notice?.kind || 'idle'}`;
+  if (showNotice) els.emptyState.innerHTML = renderStageNotice(notice);
   els.resultGrid.innerHTML = '';
-  if (!images.length) return;
+  els.resultGrid.style.display = notice ? 'none' : '';
+  if (!images.length || notice) return;
   for (const [index, image] of images.entries()) {
     const card = document.createElement('article');
     card.className = 'result-card';
@@ -224,6 +241,28 @@ function renderStage() {
       </div>`;
     els.resultGrid.appendChild(card);
   }
+}
+
+function renderStageNotice(notice) {
+  const view = notice || {
+    kind: 'idle',
+    icon: '✦',
+    title: '开始一段画图对话',
+    message: '写下第一句描述后会创建一个本地会话。后续可以继续追加提示词，也可以带参考图进入编辑模式。',
+  };
+  return `
+    <div class="spark ${escapeHtml(view.kind)}">${escapeHtml(view.icon || '✦')}</div>
+    <h3>${escapeHtml(view.title)}</h3>
+    <p>${escapeHtml(view.message)}</p>`;
+}
+
+function setStageStatus(kind, title, message, icon = '✦') {
+  state.stageStatus = { kind, title, message, icon };
+  renderStage();
+}
+
+function clearStageStatus() {
+  state.stageStatus = null;
 }
 
 function updateTags() {
@@ -246,13 +285,15 @@ async function sendPrompt() {
   if (!prompt) return toast('先写提示词', 'error');
   if (!state.apiKey.trim()) {
     els.statusLine.textContent = '先填 API Key';
+    setStageStatus('error', '缺少 API Key', '请先在右侧输入 API Key，它只会保存在当前浏览器。', '!');
     return toast('先填 API Key', 'error');
   }
 
   state.busy = true;
   els.sendIcon.textContent = '…';
   els.sendText.textContent = '生成中';
-  els.statusLine.textContent = '正在提交到 HaHaCode 图片接口...';
+  els.statusLine.textContent = '生成中';
+  setStageStatus('loading', '正在生成图片', '请求已提交到 HaHaCode 图片接口，复杂提示词或高分辨率可能需要几十秒。', '…');
   updateSendState();
 
   try {
@@ -266,20 +307,43 @@ async function sendPrompt() {
       },
       body: JSON.stringify(body),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(extractError(data.error || '生成失败'));
+    const data = await readApiResponse(res);
+    if (!res.ok) throw new Error(formatApiError(res.status, data.error || data.message || '生成失败'));
+    clearStageStatus();
     updateActiveSession({ prompt, images: data.images || [data.image].filter(Boolean) });
     els.statusLine.textContent = '生成完成';
     toast('图片生成完成');
   } catch (error) {
-    els.statusLine.textContent = error.message;
-    toast(error.message, 'error');
+    const message = error instanceof Error ? error.message : String(error);
+    els.statusLine.textContent = '生成失败';
+    setStageStatus('error', '生成失败', message, '!');
+    toast(message, 'error');
   } finally {
     state.busy = false;
     els.sendIcon.textContent = '✦';
     els.sendText.textContent = '发送';
     render();
   }
+}
+
+async function readApiResponse(res) {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text };
+  }
+}
+
+function formatApiError(status, errorText) {
+  const message = extractError(errorText);
+  if (status === 504) {
+    return '上游接口超时（504）：HaHaCode 或其后面的图片模型没有在网关等待时间内返回。建议先用 1K、张数 1 重试，或稍后再试。';
+  }
+  if (status === 429) return `请求过于频繁或额度不足（429）：${message}`;
+  if (status >= 500) return `上游接口异常（${status}）：${message}`;
+  return message;
 }
 
 function extractError(errorText) {
@@ -378,6 +442,7 @@ els.clearSessionsBtn.addEventListener('click', () => {
   render();
 });
 els.prompt.addEventListener('input', () => {
+  if (state.stageStatus?.kind !== 'loading') clearStageStatus();
   updateActiveSession({ prompt: els.prompt.value.trim() });
   render();
 });
@@ -410,6 +475,8 @@ els.editModeBtn.addEventListener('click', () => {
 });
 ['ratio', 'size', 'model', 'background', 'format', 'count'].forEach((id) => {
   $(id).addEventListener('change', () => {
+    if (state.stageStatus?.kind !== 'loading') clearStageStatus();
+    reconcileModelSize();
     updateActiveSession({ prompt: els.prompt.value.trim() });
     render();
   });

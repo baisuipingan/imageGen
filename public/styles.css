@@ -157,6 +157,14 @@ button { border: 0; }
   overflow: auto;
 }
 .empty-state { text-align: center; max-width: 520px; }
+.empty-state.loading, .empty-state.error {
+  width: min(720px, 100%);
+  max-width: 720px;
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: #fff;
+}
 .spark {
   width: 62px;
   height: 62px;
@@ -168,8 +176,15 @@ button { border: 0; }
   color: var(--primary-dark);
   font-size: 24px;
 }
+.spark.loading { animation: pulse 1.1s ease-in-out infinite; }
+.spark.error { background: #fee2e2; color: var(--danger); }
 .empty-state h3 { margin: 0; font-size: 22px; }
 .empty-state p { margin: 8px 0 0; color: var(--muted); line-height: 1.65; }
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(.92); opacity: .62; }
+}
 .result-grid {
   width: 100%;
   max-width: 960px;
