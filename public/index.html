@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#ffffff" />
+  <title>HaHaCode AI 画图</title>
+  <link rel="icon" href="/logo.png" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <button class="icon-button mobile-only" id="sidebarToggle" type="button" aria-label="打开会话列表">☰</button>
+      <a class="brand" href="/" aria-label="HaHaCode AI 画图">
+        <img src="/logo.png" alt="HaHaCode" />
+        <span>
+          <strong>HaHaCode</strong>
+          <small>AI 画图工作台</small>
+        </span>
+      </a>
+      <div class="top-actions">
+        <button class="primary-button compact" id="newSessionTopBtn" type="button">新会话</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <div>
+            <h1>画图对话</h1>
+            <p><span id="sessionCount">0</span> 个本地会话</p>
+          </div>
+          <button class="icon-button" id="closeSidebarBtn" type="button" aria-label="关闭会话列表">×</button>
+        </div>
+        <div class="sidebar-actions">
+          <button class="primary-button" id="newSessionBtn" type="button">＋ 新会话</button>
+          <button class="ghost-button" id="clearSessionsBtn" type="button">清空</button>
+        </div>
+        <div class="mode-pills">
+          <span>本地保存</span>
+          <span>生成 / 编辑</span>
+        </div>
+        <div class="session-list" id="sessionList"></div>
+      </aside>
+      <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+      <section class="main-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow" id="modeLabel">生成模式</p>
+            <h2 id="draftTitle">新建草稿</h2>
+            <p id="draftSubtitle">输入提示词开始画图。API Key 只保存在当前浏览器。</p>
+          </div>
+          <div class="summary-tags">
+            <span>模型 <b id="modelTag">gpt-image-2</b></span>
+            <span id="ratioTag">1:1（正方形）</span>
+            <span id="sizeTag">1K</span>
+            <span id="bgTag">自动背景</span>
+            <span id="fmtTag">PNG</span>
+            <span>张数 <b id="countTag">1</b></span>
+          </div>
+        </div>
+
+        <div class="stage">
+          <div class="empty-state" id="emptyState">
+            <div class="spark">✦</div>
+            <h3>开始一段画图对话</h3>
+            <p>写下第一句描述后会创建一个本地会话。后续可以继续追加提示词，也可以带参考图进入编辑模式。</p>
+          </div>
+          <div class="result-grid" id="resultGrid"></div>
+        </div>
+
+        <section class="composer-panel">
+          <div class="prompt-block">
+            <div class="prompt-toolbar">
+              <button class="tool-button active" id="generateModeBtn" type="button">生成</button>
+              <button class="tool-button" id="editModeBtn" type="button">编辑</button>
+              <span id="referenceBadge">未添加参考图</span>
+            </div>
+            <textarea id="prompt" placeholder="描述你想生成的画面。Enter 发送，Shift+Enter 换行。"></textarea>
+            <div class="prompt-footer">
+              <span id="charCount">0 字</span>
+              <span>本地草稿自动保存</span>
+            </div>
+          </div>
+
+          <aside class="control-panel">
+            <form class="field full" id="apiKeyForm" autocomplete="off">
+              <span>API Key</span>
+              <div class="secret-row">
+                <input id="apiKey" type="password" autocomplete="off" placeholder="sk-..." />
+                <button class="ghost-button" id="toggleKeyBtn" type="button">显示</button>
+              </div>
+            </form>
+
+            <div class="field-grid">
+              <label class="field">
+                <span>比例</span>
+                <select id="ratio">
+                  <option value="unspecified">未指定</option>
+                  <option value="1:1" selected>1:1 正方形</option>
+                  <option value="16:9">16:9 横版</option>
+                  <option value="4:3">4:3 横版</option>
+                  <option value="3:4">3:4 竖版</option>
+                  <option value="9:16">9:16 竖版</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>清晰度</span>
+                <select id="size">
+                  <option value="1K" selected>1K</option>
+                  <option value="2K">2K</option>
+                  <option value="4K">4K</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>模型</span>
+                <select id="model">
+                  <option value="gpt-image-2" selected>gpt-image-2</option>
+                  <option value="gpt-image-1.5">gpt-image-1.5</option>
+                  <option value="gpt-image-1">gpt-image-1</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>背景</span>
+                <select id="background">
+                  <option value="auto" selected>自动背景</option>
+                  <option value="transparent">透明背景</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>格式</span>
+                <select id="format">
+                  <option value="png" selected>PNG</option>
+                  <option value="webp">WebP</option>
+                  <option value="jpeg">JPEG</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>张数</span>
+                <input id="count" type="number" min="1" max="4" value="1" />
+              </label>
+            </div>
+
+            <input id="referenceInput" type="file" accept="image/*" hidden />
+            <div class="reference-preview" id="referencePreview">
+              <span>参考图</span>
+              <button class="ghost-button" id="pickReferenceBtn" type="button">选择图片</button>
+            </div>
+
+            <div class="control-actions">
+              <button class="ghost-button" id="clearPromptBtn" type="button">清空提示词</button>
+              <button class="ghost-button" id="duplicateBtn" type="button">复制会话</button>
+            </div>
+            <button class="primary-button send-button" id="sendBtn" type="button" disabled>
+              <span id="sendIcon">✦</span>
+              <span id="sendText">发送</span>
+            </button>
+            <div class="status-line" id="statusLine">准备就绪</div>
+          </aside>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div class="lightbox" id="lightbox" aria-hidden="true">
+    <div class="lightbox-panel" role="dialog" aria-modal="true" aria-label="图片预览">
+      <button class="icon-button lightbox-close" id="lightboxCloseBtn" type="button" aria-label="关闭预览">×</button>
+      <img id="lightboxImage" alt="放大预览" />
+    </div>
+  </div>
+  <div class="toast-stack" id="toastStack"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
