@@ -90,14 +90,38 @@ button { border: 0; }
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--surface-soft);
-  padding: 12px;
-  cursor: pointer;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
   transition: border-color .15s, background .15s, transform .15s;
 }
 .session-card:hover { border-color: var(--primary); transform: translateY(-1px); }
 .session-card.active { border-color: #9ee8df; background: var(--primary-soft); }
-.session-card strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-card span { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.session-main {
+  min-width: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 4px;
+  text-align: left;
+}
+.session-main:focus-visible, .session-delete:focus-visible { outline: 3px solid rgba(16,169,155,.22); outline-offset: 2px; }
+.session-main strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-main span { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.session-delete {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+}
+.session-delete:hover { background: #fee2e2; color: var(--danger); }
 
 .main-panel { display: flex; flex-direction: column; min-height: calc(100vh - 104px); overflow: hidden; }
 .panel-head {

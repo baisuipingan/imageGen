@@ -1,27 +1,29 @@
 # HaHaCode AI Image Worker
 
-A lightweight AI image generation workspace built on Cloudflare Workers. It serves a static SPA with Workers Assets and proxies image generation requests through a Hono API route.
+简体中文 | [English](./README.en.md)
 
-## Features
+一个部署在 Cloudflare Workers 上的轻量级 AI 图片生成工作台。项目使用 Workers Assets 托管静态 SPA，并通过 Hono API 路由代理图片生成请求。
 
-- Single-page image generation workspace
-- Local browser API key storage
-- Local browser session history
-- Text-to-image and reference-image edit flow
-- Responsive desktop/mobile layout
-- Result preview, fullscreen preview, and download
-- Cloudflare Workers Static Assets deployment
+## 功能特性
 
-## Tech Stack
+- 单页图片生成工作台
+- API Key 仅保存在用户浏览器本地
+- 浏览器本地会话历史
+- 支持文生图和参考图编辑流程
+- 适配桌面端和移动端的响应式布局
+- 图片结果预览、全屏查看和下载
+- 支持 Cloudflare Workers Static Assets 部署
+
+## 技术栈
 
 - TypeScript
 - Hono
 - Cloudflare Workers
 - Cloudflare Workers Static Assets
 - Wrangler
-- Plain HTML/CSS/JavaScript frontend
+- 原生 HTML/CSS/JavaScript 前端
 
-## Project Structure
+## 项目结构
 
 ```text
 .
@@ -37,43 +39,43 @@ A lightweight AI image generation workspace built on Cloudflare Workers. It serv
 └── wrangler.jsonc
 ```
 
-## How It Works
+## 工作原理
 
-- Static frontend files are served from `public/` through Cloudflare Workers Assets.
-- API calls under `/api/*` run through the Worker first.
-- The browser stores the user's API key in `localStorage`.
-- The frontend sends the API key in the `Authorization` header only when generating images.
-- The Worker forwards requests to `BASE_URL`, which should be an OpenAI-compatible API base URL.
+- `public/` 目录中的静态前端文件由 Cloudflare Workers Assets 托管。
+- `/api/*` 下的请求会先进入 Worker。
+- 用户输入的 API Key 保存在浏览器 `localStorage` 中。
+- 前端只会在生成图片时通过 `Authorization` 请求头发送 API Key。
+- Worker 会把请求转发到 `BASE_URL`，该地址应为 OpenAI 兼容接口的基础地址。
 
-## Development
+## 本地开发
 
-Install dependencies:
+安装依赖：
 
 ```bash
 npm install
 ```
 
-Start the local Worker:
+启动本地 Worker：
 
 ```bash
 npm run dev
 ```
 
-Then open the local URL printed by Wrangler, usually:
+然后打开 Wrangler 输出的本地地址，通常是：
 
 ```text
 http://localhost:8787
 ```
 
-Type-check:
+类型检查：
 
 ```bash
 npx tsc --noEmit
 ```
 
-## Configuration
+## 配置说明
 
-`wrangler.jsonc` contains the Worker and asset configuration:
+`wrangler.jsonc` 中包含 Worker 和静态资源配置：
 
 ```jsonc
 {
@@ -83,41 +85,26 @@ npx tsc --noEmit
 }
 ```
 
-For another OpenAI-compatible endpoint, change `BASE_URL`.
+如果需要使用其他 OpenAI 兼容接口，修改 `BASE_URL` 即可。
 
-The API key is intentionally not stored as a Worker secret. Users enter their own key in the browser UI, and it is saved only in that browser's local storage.
+API Key 不会作为 Worker Secret 保存。用户需要在页面中输入自己的 Key，它只会保存在当前浏览器的本地存储中。
 
-## Deployment
+## 部署
 
-Make sure you are logged in to Cloudflare:
+先确认已经登录 Cloudflare：
 
 ```bash
 npx wrangler login
 ```
 
-Deploy:
+部署到 Cloudflare Workers：
 
 ```bash
 npm run deploy
 ```
 
-Wrangler will upload the Worker and static assets from `public/`.
+Wrangler 会上传 Worker 代码，并一起发布 `public/` 目录下的静态资源。
 
-## Notes For Open Source
+## 许可证
 
-Do not commit local or generated files such as:
-
-- `node_modules/`
-- `.wrangler/`
-- `.dev.vars`
-- `.env*`
-- `.idea/`
-- `.playwright-cli/`
-- `work/`
-- `.DS_Store`
-
-These are already covered by `.gitignore`.
-
-## License
-
-Add a license before publishing if you want others to reuse the project.
+本项目基于 [MIT License](./LICENSE) 开源。

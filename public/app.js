@@ -127,6 +127,19 @@ function updateActiveSession(patch) {
   persistSessions();
 }
 
+function deleteSession(sessionId) {
+  const index = state.sessions.findIndex((session) => session.id === sessionId);
+  if (index < 0) return;
+  const [removed] = state.sessions.splice(index, 1);
+  if (state.activeId === sessionId) {
+    state.activeId = state.sessions[index]?.id || state.sessions[index - 1]?.id || null;
+    applySessionToForm(activeSession());
+  }
+  persistSessions();
+  render();
+  toast(`已删除「${removed.title || '会话'}」`);
+}
+
 function applySessionToForm(session) {
   els.prompt.value = session?.prompt || '';
   if (session?.settings) {
@@ -166,23 +179,31 @@ function renderSessions() {
   if (!state.sessions.length) {
     const empty = document.createElement('div');
     empty.className = 'session-card active';
-    empty.innerHTML = '<strong>新建草稿</strong><span>输入提示词开始画图</span>';
-    empty.addEventListener('click', () => createSession());
+    empty.innerHTML = '<button class="session-main" type="button"><strong>新建草稿</strong><span>输入提示词开始画图</span></button>';
+    empty.querySelector('.session-main').addEventListener('click', () => createSession());
     els.sessionList.appendChild(empty);
     return;
   }
   for (const session of state.sessions) {
-    const button = document.createElement('button');
-    button.className = `session-card${session.id === state.activeId ? ' active' : ''}`;
-    button.type = 'button';
-    button.innerHTML = `<strong>${escapeHtml(session.title)}</strong><span>${escapeHtml(session.prompt || '空提示词')}</span>`;
-    button.addEventListener('click', () => {
+    const card = document.createElement('div');
+    card.className = `session-card${session.id === state.activeId ? ' active' : ''}`;
+    card.innerHTML = `
+      <button class="session-main" type="button">
+        <strong>${escapeHtml(session.title)}</strong>
+        <span>${escapeHtml(session.prompt || '空提示词')}</span>
+      </button>
+      <button class="session-delete" type="button" title="删除会话" aria-label="删除 ${escapeHtml(session.title || '会话')}">×</button>`;
+    card.querySelector('.session-main').addEventListener('click', () => {
       state.activeId = session.id;
       applySessionToForm(session);
       closeSidebar();
       render();
     });
-    els.sessionList.appendChild(button);
+    card.querySelector('.session-delete').addEventListener('click', () => {
+      if (!confirm('删除这个本地会话？')) return;
+      deleteSession(session.id);
+    });
+    els.sessionList.appendChild(card);
   }
 }
 
