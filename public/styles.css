@@ -252,6 +252,7 @@ textarea {
 .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .field span { color: var(--muted); font-size: 12px; font-weight: 700; }
 .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.field-grid .full-row { grid-column: 1 / -1; }
 input, select {
   height: 42px;
   width: 100%;

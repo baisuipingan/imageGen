@@ -1,6 +1,12 @@
 const $ = (id) => document.getElementById(id);
 const storeKey = 'hahacode.image.sessions';
 const apiKeyStoreKey = 'hahacode.image.apiKey';
+const defaultModel = 'gpt-image-2';
+const imageRequestTimeoutMs = 5 * 60 * 1000;
+const imageDbName = 'hahacode.image.storage';
+const imageStoreName = 'session-images';
+const imageRefPrefix = 'idb:';
+let imageDbPromise = null;
 
 const state = {
   sessions: [],
@@ -76,20 +82,121 @@ function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function loadState() {
+async function loadState() {
   try {
     state.sessions = JSON.parse(localStorage.getItem(storeKey) || '[]');
   } catch {
     state.sessions = [];
   }
+  await hydrateStoredImages();
   state.apiKey = localStorage.getItem(apiKeyStoreKey) || '';
   els.apiKey.value = state.apiKey;
   state.activeId = state.sessions[0]?.id || null;
+  persistSessions();
   applySessionToForm(activeSession());
 }
 
 function persistSessions() {
-  localStorage.setItem(storeKey, JSON.stringify(state.sessions));
+  const sessions = state.sessions.map((session) => {
+    const stored = { ...session };
+    delete stored._persistedImages;
+    stored.images = (session.images || []).map((image, index) => {
+      if (!isEmbeddedImage(image)) return image;
+      if (!('indexedDB' in window)) return '';
+
+      const key = storedImageKey(session.id, index);
+      session._persistedImages ||= {};
+      if (session._persistedImages[index] !== image) {
+        session._persistedImages[index] = image;
+        storeImageValue(key, image).catch((error) => console.warn('Failed to store session image:', error));
+      }
+      return `${imageRefPrefix}${key}`;
+    });
+    return stored;
+  });
+
+  const serialized = JSON.stringify(sessions);
+  try {
+    localStorage.setItem(storeKey, serialized);
+  } catch (error) {
+    try {
+      localStorage.removeItem(storeKey);
+      localStorage.setItem(storeKey, serialized);
+    } catch (retryError) {
+      console.warn('Failed to store session metadata:', retryError || error);
+    }
+  }
+}
+
+function isEmbeddedImage(value) {
+  return typeof value === 'string' && value.startsWith('data:image/');
+}
+
+function storedImageKey(sessionId, index) {
+  return `${sessionId}:${index}`;
+}
+
+function openImageDb() {
+  if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB is unavailable'));
+  if (imageDbPromise) return imageDbPromise;
+
+  imageDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(imageDbName, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(imageStoreName)) {
+        request.result.createObjectStore(imageStoreName);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB'));
+  });
+  return imageDbPromise;
+}
+
+async function runImageStore(mode, operation) {
+  const db = await openImageDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(imageStoreName, mode);
+    const store = transaction.objectStore(imageStoreName);
+    const request = operation(store);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB operation failed'));
+  });
+}
+
+function storeImageValue(key, value) {
+  return runImageStore('readwrite', (store) => store.put(value, key));
+}
+
+function loadImageValue(key) {
+  return runImageStore('readonly', (store) => store.get(key));
+}
+
+function deleteImageValue(key) {
+  return runImageStore('readwrite', (store) => store.delete(key));
+}
+
+function clearImageValues() {
+  return runImageStore('readwrite', (store) => store.clear());
+}
+
+async function hydrateStoredImages() {
+  await Promise.all(state.sessions.map(async (session) => {
+    const images = await Promise.all((session.images || []).map(async (image, index) => {
+      if (typeof image !== 'string' || !image.startsWith(imageRefPrefix)) return image;
+      try {
+        const value = await loadImageValue(image.slice(imageRefPrefix.length));
+        if (value) {
+          session._persistedImages ||= {};
+          session._persistedImages[index] = value;
+        }
+        return value || '';
+      } catch {
+        return '';
+      }
+    }));
+    session.images = images.filter(Boolean);
+  }));
 }
 
 function persistApiKey(value) {
@@ -132,6 +239,9 @@ function deleteSession(sessionId) {
   const index = state.sessions.findIndex((session) => session.id === sessionId);
   if (index < 0) return;
   const [removed] = state.sessions.splice(index, 1);
+  for (let imageIndex = 0; imageIndex < Math.max(4, removed.images?.length || 0); imageIndex += 1) {
+    deleteImageValue(storedImageKey(sessionId, imageIndex)).catch(() => undefined);
+  }
   if (state.activeId === sessionId) {
     state.activeId = state.sessions[index]?.id || state.sessions[index - 1]?.id || null;
     applySessionToForm(activeSession());
@@ -146,7 +256,7 @@ function applySessionToForm(session) {
   if (session?.settings) {
     els.ratio.value = session.settings.ratio || '1:1';
     els.size.value = normalizeQuality(session.settings.quality || session.settings.size || 'auto');
-    els.model.value = session.settings.model || 'gpt-image-2';
+    els.model.value = session.settings.model || defaultModel;
     els.background.value = session.settings.background || 'auto';
     els.format.value = session.settings.output_format || 'png';
     els.count.value = session.settings.n || 1;
@@ -172,6 +282,12 @@ function reconcileModelSize() {
   if (els.model.value === 'gpt-image-2-2k') {
     els.model.value = 'gpt-image-2';
   }
+  if (!els.model.value) els.model.value = defaultModel;
+
+  const singleImageOnly = els.model.value.startsWith('gpt-image-nana-');
+  if (singleImageOnly) els.count.value = '1';
+  els.count.disabled = singleImageOnly;
+  els.count.title = singleImageOnly ? '该模型每次生成 1 张图片' : '';
 }
 
 function normalizeQuality(value) {
@@ -309,6 +425,7 @@ async function sendPrompt() {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(imageRequestTimeoutMs),
     });
     if (res.headers.get('Content-Type')?.includes('text/event-stream')) {
       const data = await readImageStream(res, prompt);
@@ -326,7 +443,9 @@ async function sendPrompt() {
     els.statusLine.textContent = '生成完成';
     toast('图片生成完成');
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = error?.name === 'TimeoutError'
+      ? '等待已超过 5 分钟，生成任务可能仍在上游执行，请稍后查看任务状态。'
+      : error instanceof Error ? error.message : String(error);
     els.statusLine.textContent = '生成失败';
     setStageStatus('error', '生成失败', message, '!');
     toast(message, 'error');
@@ -360,26 +479,51 @@ async function readImageStream(res, prompt) {
       const event = parseSseChunk(chunk);
       if (!event.data) continue;
       const data = parseJson(event.data);
-      if (event.event === 'status') {
+      const type = data.type || event.event;
+      if (type === 'status' || type === 'image_generation.started') {
         setStageStatus('loading', '正在生成图片', data.message || '模型正在处理，请保持页面打开。', '…');
       }
-      if (event.event === 'partial' && data.image) {
-        images[data.index || 0] = data.image;
+      if (type === 'image_generation.status') {
+        const progress = Number(data.progress);
+        const message = Number.isFinite(progress)
+          ? `图片生成中，当前进度 ${Math.max(0, Math.min(100, progress))}%...`
+          : '图片生成中，请保持页面打开。';
+        setStageStatus('loading', '正在生成图片', message, '…');
+      }
+      if ((type === 'partial' && data.image) || (type === 'image_generation.partial_image' && data.b64_json)) {
+        const index = data.index ?? data.partial_image_index ?? 0;
+        images[index] = data.image || `data:image/${els.format.value};base64,${data.b64_json}`;
         updateActiveSession({ prompt, images: images.filter(Boolean) });
         setStageStatus('loading', '收到部分图片', '模型还在继续完善图片，请稍等最终结果。', '…');
       }
-      if (event.event === 'done') {
+      if (type === 'done') {
         return { images: data.images || images.filter(Boolean) };
       }
-      if (event.event === 'error') {
+      if (type === 'image_generation.completed') {
+        const completedImages = extractStreamImages(data);
+        if (completedImages.length) return { images: completedImages };
+        throw new Error('上游返回了完成事件，但没有图片地址。');
+      }
+      if (type === 'error') {
         if (data.detail) console.warn('Image stream detail:', data.detail);
-        throw new Error(data.error || '图片生成失败');
+        throw new Error(data.error?.message || data.error || data.message || '图片生成失败');
       }
     }
   }
 
   if (images.length) return { images: images.filter(Boolean) };
   throw new Error('图片生成流结束，但没有收到图片。');
+}
+
+function extractStreamImages(data) {
+  const values = [data.url, data.image_url, data.image];
+  if (data.b64_json) values.push(`data:image/${els.format.value};base64,${data.b64_json}`);
+  for (const item of data.data || []) {
+    if (item.url) values.push(item.url);
+    if (item.image_url) values.push(item.image_url);
+    if (item.b64_json) values.push(`data:image/${els.format.value};base64,${item.b64_json}`);
+  }
+  return values.filter((value, index, list) => Boolean(value) && list.indexOf(value) === index);
 }
 
 function parseSseChunk(chunk) {
@@ -510,6 +654,7 @@ els.clearSessionsBtn.addEventListener('click', () => {
   if (!confirm('清空所有本地会话？')) return;
   state.sessions = [];
   state.activeId = null;
+  clearImageValues().catch(() => undefined);
   persistSessions();
   applySessionToForm(null);
   render();
@@ -572,7 +717,7 @@ els.clearPromptBtn.addEventListener('click', () => {
 els.duplicateBtn.addEventListener('click', () => {
   const session = activeSession();
   if (!session) return createSession();
-  const copy = { ...session, id: uid(), title: `${session.title} 副本`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const copy = { ...session, id: uid(), title: `${session.title} 副本`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), _persistedImages: {} };
   state.sessions.unshift(copy);
   state.activeId = copy.id;
   persistSessions();
@@ -597,6 +742,10 @@ window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && els.lightbox.classList.contains('open')) closeLightbox();
 });
 
-loadState();
-bindReferenceButtons();
-render();
+async function initialize() {
+  await loadState();
+  bindReferenceButtons();
+  render();
+}
+
+initialize();

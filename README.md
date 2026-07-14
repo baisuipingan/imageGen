@@ -10,6 +10,7 @@
 - API Key 仅保存在用户浏览器本地
 - 浏览器本地会话历史
 - 支持文生图和参考图编辑流程
+- 支持 OpenAI Image 与 HaHaCode Nana 系列生图模型
 - 适配桌面端和移动端的响应式布局
 - 图片结果预览、全屏查看和下载
 - 支持 Cloudflare Workers Static Assets 部署
@@ -80,7 +81,7 @@ npx tsc --noEmit
 ```jsonc
 {
   "vars": {
-    "BASE_URL": "https://hahacode.com"
+    "BASE_URL": "https://api.hahacode.com"
   }
 }
 ```

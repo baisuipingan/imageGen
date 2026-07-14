@@ -2,6 +2,12 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "imagegen-worker",
   "main": "src/index.ts",
+  "routes": [
+    {
+      "pattern": "img2.hahacode.com",
+      "custom_domain": true
+    }
+  ],
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
@@ -11,6 +17,6 @@
     "run_worker_first": ["/api/*", "/health"]
   },
   "vars": {
-    "BASE_URL": "https://hahacode.com"
+    "BASE_URL": "https://api.hahacode.com"
   }
 }

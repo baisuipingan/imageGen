@@ -43,6 +43,7 @@ type ImageResponse = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
+const IMAGE_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 app.get('/health', (c) => c.json({ ok: true }));
 
@@ -76,11 +77,13 @@ app.post('/api/generate', async (c) => {
       form.append('background', normalizeBackground(body));
       form.append('output_format', body.output_format || 'png');
       form.append('n', String(body.n || 1));
+      if (isNanaModel(requestModel)) form.append('stream', 'true');
 
       upstream = await fetch(url, {
         method: 'POST',
         headers: { Authorization: `Bearer ${apiKey}` },
         body: form,
+        signal: AbortSignal.timeout(IMAGE_REQUEST_TIMEOUT_MS),
       });
     } else {
       upstream = await fetch(url, {
@@ -100,6 +103,7 @@ app.post('/api/generate', async (c) => {
           stream: true,
           partial_images: 2,
         }),
+        signal: AbortSignal.timeout(IMAGE_REQUEST_TIMEOUT_MS),
       });
     }
   } catch (error) {
@@ -110,7 +114,7 @@ app.post('/api/generate', async (c) => {
   }
 
   if (!upstream.ok) return upstreamErrorResponse(upstream, await upstream.text());
-  if (!useEdit && isEventStream(upstream)) return streamImageEvents(upstream, body.output_format || 'png');
+  if (isEventStream(upstream)) return streamImageEvents(upstream);
 
   const text = await upstream.text();
 
@@ -141,6 +145,10 @@ function normalizeBackground(body: ImageBody) {
   return body.background || 'auto';
 }
 
+function isNanaModel(model: string) {
+  return model.startsWith('gpt-image-nana-');
+}
+
 function upstreamErrorResponse(upstream: Response, text: string) {
   return new Response(JSON.stringify({
     error: extractUpstreamError(text),
@@ -155,98 +163,16 @@ function isEventStream(response: Response) {
   return response.headers.get('Content-Type')?.includes('text/event-stream');
 }
 
-function streamImageEvents(upstream: Response, format: string) {
+function streamImageEvents(upstream: Response) {
   if (!upstream.body) return Response.json({ error: 'Upstream stream is empty' }, { status: 502 });
-
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const reader = upstream.body.getReader();
-  let buffer = '';
-  const streamImages: string[] = [];
-  const seenEvents: string[] = [];
-
-  const body = new ReadableStream({
-    async start(controller) {
-      const send = (event: string, data: unknown) => {
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-      };
-
-      send('status', { message: '图片生成请求已开始，正在等待模型返回...' });
-
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const chunks = buffer.split(/\n\n+/);
-          buffer = chunks.pop() || '';
-          for (const chunk of chunks) {
-            const parsed = parseSseChunk(chunk);
-            if (!parsed.data) continue;
-            const event = parseJson(parsed.data);
-            if (!event) continue;
-            const type = event?.type || parsed.event;
-            if (type && !seenEvents.includes(type)) seenEvents.push(type);
-            const images = extractImages(event, format);
-            if (images.length) streamImages.push(...images);
-
-            if (type === 'image_generation.partial_image' && event?.b64_json) {
-              send('partial', {
-                image: asDataUrl(event.b64_json, format),
-                index: event.partial_image_index || 0,
-              });
-            }
-            if (type === 'image_generation.completed') {
-              if (streamImages.length) send('done', { images: unique(streamImages) });
-              else send('error', {
-                error: '上游返回了完成事件，但事件里没有图片数据。',
-                detail: summarizeStreamEvents(seenEvents, event),
-              });
-              return;
-            }
-          }
-        }
-
-        if (streamImages.length) send('done', { images: unique(streamImages) });
-        else send('error', {
-          error: '上游流式响应结束，但没有返回最终图片。',
-          detail: { event_types: seenEvents },
-        });
-      } catch (error) {
-        send('error', { error: error instanceof Error ? error.message : String(error) });
-      } finally {
-        controller.close();
-      }
-    },
-    cancel() {
-      reader.cancel().catch(() => undefined);
-    },
-  });
-
-  return new Response(body, {
+  return new Response(upstream.body, {
     headers: {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
     },
   });
-}
-
-function parseSseChunk(chunk: string) {
-  const result = { event: '', data: '' };
-  for (const line of chunk.split(/\r?\n/)) {
-    if (line.startsWith('event:')) result.event = line.slice(6).trim();
-    if (line.startsWith('data:')) result.data += line.slice(5).trim();
-  }
-  return result;
-}
-
-function parseJson(value: string) {
-  try {
-    return JSON.parse(value) as Record<string, any>;
-  } catch {
-    return null;
-  }
 }
 
 function extractUpstreamError(text: string) {
@@ -291,10 +217,6 @@ function extractImages(data: ImageResponse, format: string) {
     .filter((value, index, list) => Boolean(value) && list.indexOf(value) === index);
 }
 
-function unique(values: string[]) {
-  return values.filter((value, index, list) => Boolean(value) && list.indexOf(value) === index);
-}
-
 function normalizeImageValue(value: string, format: string) {
   if (!value) return '';
   if (value.startsWith('data:image/') || value.startsWith('http://') || value.startsWith('https://')) return value;
@@ -312,13 +234,6 @@ function summarizeImageResponse(data: ImageResponse) {
     data_keys: data.data?.[0] ? Object.keys(data.data[0]) : [],
     output_count: data.output?.length || 0,
     output_keys: data.output?.[0] ? Object.keys(data.output[0]) : [],
-  };
-}
-
-function summarizeStreamEvents(eventTypes: string[], lastEvent: Record<string, any>) {
-  return {
-    event_types: eventTypes,
-    last_event_keys: Object.keys(lastEvent || {}),
   };
 }
 

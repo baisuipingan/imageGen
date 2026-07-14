@@ -10,6 +10,7 @@ A lightweight AI image generation workspace built on Cloudflare Workers. It serv
 - Local browser API key storage
 - Local browser session history
 - Text-to-image and reference-image edit flow
+- OpenAI Image and HaHaCode Nana image model support
 - Responsive desktop/mobile layout
 - Result preview, fullscreen preview, and download
 - Cloudflare Workers Static Assets deployment
@@ -80,7 +81,7 @@ npx tsc --noEmit
 ```jsonc
 {
   "vars": {
-    "BASE_URL": "https://hahacode.com"
+    "BASE_URL": "https://api.hahacode.com"
   }
 }
 ```
