@@ -744,7 +744,7 @@ function formatApiError(status, errorText) {
   const message = extractError(errorText);
   if (/current account image benefits do not support the requested image parameters/i.test(message)) {
     const requestId = message.match(/request id:\s*([^\s)]+)/i)?.[1];
-    return `当前上游账号暂不支持所选模型与图片参数组合。请尝试 1:1、自动清晰度，或切换模型后重试。${requestId ? `（request id: ${requestId}）` : ''}`;
+    return `当前上游图片账号的生成权益不可用或已耗尽，这与 API Key 的 HaHaCode 余额无关。请切换其他生图模型，或等待上游账号恢复后重试。${requestId ? `（request id: ${requestId}）` : ''}`;
   }
   if (status === 504) {
     return '上游接口超时（504）：HaHaCode 或其后面的图片模型没有在网关等待时间内返回。建议先用自动清晰度、张数 1 重试，或稍后再试。';
