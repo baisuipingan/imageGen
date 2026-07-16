@@ -86,27 +86,23 @@ app.post('/api/generate', async (c) => {
         signal: AbortSignal.timeout(IMAGE_REQUEST_TIMEOUT_MS),
       });
     } else {
-      const payload: Record<string, unknown> = {
-        model: requestModel,
-        prompt: requestPrompt,
-        size: requestSize,
-        quality: requestQuality,
-        background: normalizeBackground(body),
-        output_format: body.output_format || 'png',
-        n: body.n || 1,
-      };
-      if (isNanaModel(requestModel)) {
-        payload.stream = true;
-        payload.partial_images = 2;
-      }
-
       upstream = await fetch(url, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          model: requestModel,
+          prompt: requestPrompt,
+          size: requestSize,
+          quality: requestQuality,
+          background: normalizeBackground(body),
+          output_format: body.output_format || 'png',
+          n: body.n || 1,
+          stream: true,
+          partial_images: 2,
+        }),
         signal: AbortSignal.timeout(IMAGE_REQUEST_TIMEOUT_MS),
       });
     }
