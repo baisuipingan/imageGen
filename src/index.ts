@@ -43,7 +43,6 @@ type ImageResponse = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
-const IMAGE_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 app.get('/health', (c) => c.json({ ok: true }));
 
@@ -83,7 +82,6 @@ app.post('/api/generate', async (c) => {
         method: 'POST',
         headers: { Authorization: `Bearer ${apiKey}` },
         body: form,
-        signal: AbortSignal.timeout(IMAGE_REQUEST_TIMEOUT_MS),
       });
     } else {
       upstream = await fetch(url, {
@@ -103,7 +101,6 @@ app.post('/api/generate', async (c) => {
           stream: true,
           partial_images: 2,
         }),
-        signal: AbortSignal.timeout(IMAGE_REQUEST_TIMEOUT_MS),
       });
     }
   } catch (error) {

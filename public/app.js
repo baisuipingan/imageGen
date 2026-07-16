@@ -2,7 +2,6 @@ const $ = (id) => document.getElementById(id);
 const storeKey = 'hahacode.image.sessions';
 const apiKeyStoreKey = 'hahacode.image.apiKey';
 const defaultModel = 'gpt-image-2';
-const imageRequestTimeoutMs = 5 * 60 * 1000;
 const imageDbName = 'hahacode.image.storage';
 const imageStoreName = 'session-images';
 const imageRefPrefix = 'idb:';
@@ -527,10 +526,7 @@ function startSessionRequest(sessionId) {
   abortSessionRequest(sessionId);
   const id = uid();
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => {
-    controller.abort(new DOMException('Image generation timed out', 'TimeoutError'));
-  }, imageRequestTimeoutMs);
-  const request = { id, controller, timeoutId };
+  const request = { id, controller };
   sessionRequests.set(sessionId, request);
   return request;
 }
@@ -542,14 +538,12 @@ function isCurrentRequest(sessionId, requestId) {
 function finishSessionRequest(sessionId, requestId) {
   const request = sessionRequests.get(sessionId);
   if (!request || request.id !== requestId) return;
-  clearTimeout(request.timeoutId);
   sessionRequests.delete(sessionId);
 }
 
 function abortSessionRequest(sessionId) {
   const request = sessionRequests.get(sessionId);
   if (!request) return;
-  clearTimeout(request.timeoutId);
   sessionRequests.delete(sessionId);
   request.controller.abort();
 }
@@ -599,9 +593,17 @@ async function sendPrompt() {
         format: settings.output_format,
       });
       if (!isCurrentRequest(sessionId, request.id)) return;
-      updateSession(sessionId, { prompt, images: data.images, stageStatus: null, statusText: '生成完成', busy: false });
+      updateSession(sessionId, {
+        prompt,
+        images: data.images,
+        stageStatus: null,
+        statusText: data.incomplete ? '已保留部分结果' : '生成完成',
+        busy: false,
+      });
       render();
-      if (state.activeId === sessionId) toast('图片生成完成');
+      if (state.activeId === sessionId) {
+        toast(data.incomplete ? '最终图片传输中断，已保留收到的预览图。' : '图片生成完成', data.incomplete ? 'error' : 'success');
+      }
       return;
     }
     const data = await readApiResponse(res);
@@ -619,10 +621,7 @@ async function sendPrompt() {
     if (state.activeId === sessionId) toast('图片生成完成');
   } catch (error) {
     if (!isCurrentRequest(sessionId, request.id)) return;
-    const reason = request.controller.signal.reason || error;
-    const message = reason?.name === 'TimeoutError'
-      ? '等待已超过 5 分钟，生成任务可能仍在上游执行，请稍后查看任务状态。'
-      : error instanceof Error ? error.message : String(error);
+    const message = formatRequestError(error, request.controller.signal);
     updateSession(sessionId, {
       busy: false,
       statusText: '生成失败',
@@ -653,7 +652,17 @@ async function readImageStream(res, context) {
   let buffer = '';
 
   while (true) {
-    const { value, done } = await reader.read();
+    let result;
+    try {
+      result = await reader.read();
+    } catch (error) {
+      if (images.length) {
+        console.warn('Final image stream was interrupted; keeping partial images:', error);
+        return { images: images.filter(Boolean), incomplete: true };
+      }
+      throw error;
+    }
+    const { value, done } = result;
     if (done) break;
     if (!isCurrentRequest(sessionId, requestId)) {
       await reader.cancel();
@@ -684,11 +693,11 @@ async function readImageStream(res, context) {
         setSessionStageStatus(sessionId, 'loading', '收到部分图片', '模型还在继续完善图片，请稍等最终结果。', '…');
       }
       if (type === 'done') {
-        return { images: data.images || images.filter(Boolean) };
+        return { images: data.images || images.filter(Boolean), incomplete: false };
       }
       if (type === 'image_generation.completed') {
         const completedImages = extractStreamImages(data, format);
-        if (completedImages.length) return { images: completedImages };
+        if (completedImages.length) return { images: completedImages, incomplete: false };
         throw new Error('上游返回了完成事件，但没有图片地址。');
       }
       if (type === 'error') {
@@ -698,8 +707,17 @@ async function readImageStream(res, context) {
     }
   }
 
-  if (images.length) return { images: images.filter(Boolean) };
+  if (images.length) return { images: images.filter(Boolean), incomplete: true };
   throw new Error('图片生成流结束，但没有收到图片。');
+}
+
+function formatRequestError(error, signal) {
+  const reason = signal.reason || error;
+  const message = reason instanceof Error ? reason.message : String(reason);
+  if (/network error|failed to fetch|networkerror|load failed/i.test(message)) {
+    return '图片返回链路在传输完成前中断。上游可能已经生成并产生使用记录，请先到 HaHaCode 使用记录确认后再决定是否重试。';
+  }
+  return message;
 }
 
 function extractStreamImages(data, format) {
