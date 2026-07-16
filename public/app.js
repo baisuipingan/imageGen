@@ -7,15 +7,12 @@ const imageDbName = 'hahacode.image.storage';
 const imageStoreName = 'session-images';
 const imageRefPrefix = 'idb:';
 let imageDbPromise = null;
+const sessionRequests = new Map();
 
 const state = {
   sessions: [],
   activeId: null,
-  mode: 'generate',
-  referenceImage: '',
-  busy: false,
   apiKey: '',
-  stageStatus: null,
 };
 
 const els = {
@@ -78,13 +75,75 @@ function activeSession() {
   return state.sessions.find((session) => session.id === state.activeId) || null;
 }
 
+function findSession(sessionId) {
+  return state.sessions.find((session) => session.id === sessionId) || null;
+}
+
+function defaultSettings() {
+  return {
+    model: defaultModel,
+    ratio: '1:1',
+    quality: 'auto',
+    background: 'auto',
+    output_format: 'png',
+    n: 1,
+  };
+}
+
+function normalizeSettings(settings = {}) {
+  const defaults = defaultSettings();
+  return {
+    model: settings.model === 'gpt-image-2-2k' ? defaultModel : settings.model || defaults.model,
+    ratio: settings.ratio || defaults.ratio,
+    quality: normalizeQuality(settings.quality || settings.size || defaults.quality),
+    background: settings.background || defaults.background,
+    output_format: settings.output_format || defaults.output_format,
+    n: Math.max(1, Math.min(4, Number(settings.n || defaults.n))),
+  };
+}
+
+function normalizeSession(value) {
+  const session = value && typeof value === 'object' ? value : {};
+  const prompt = typeof session.prompt === 'string' ? session.prompt : '';
+  let stageStatus = session.stageStatus && typeof session.stageStatus === 'object' ? session.stageStatus : null;
+  let statusText = typeof session.statusText === 'string'
+    ? session.statusText
+    : Array.isArray(session.images) && session.images.length ? '生成完成' : '准备就绪';
+
+  if (stageStatus?.kind === 'loading') {
+    stageStatus = {
+      kind: 'error',
+      icon: '!',
+      title: '生成已中断',
+      message: '页面刷新后无法继续跟踪上一条生成请求，请重新发送。',
+    };
+    statusText = '生成已中断';
+  }
+
+  return {
+    ...session,
+    id: typeof session.id === 'string' && session.id ? session.id : uid(),
+    title: typeof session.title === 'string' && session.title ? session.title : prompt.slice(0, 24) || '新建草稿',
+    prompt,
+    images: Array.isArray(session.images) ? session.images.filter((image) => typeof image === 'string' && image) : [],
+    settings: normalizeSettings(session.settings),
+    mode: session.mode === 'edit' ? 'edit' : 'generate',
+    referenceImage: typeof session.referenceImage === 'string' ? session.referenceImage : '',
+    referenceName: typeof session.referenceName === 'string' ? session.referenceName : '',
+    stageStatus,
+    statusText,
+    busy: false,
+  };
+}
+
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 async function loadState() {
   try {
-    state.sessions = JSON.parse(localStorage.getItem(storeKey) || '[]');
+    const storedSessions = JSON.parse(localStorage.getItem(storeKey) || '[]');
+    state.sessions = Array.isArray(storedSessions) ? storedSessions.map(normalizeSession) : [];
   } catch {
     state.sessions = [];
   }
@@ -100,6 +159,8 @@ function persistSessions() {
   const sessions = state.sessions.map((session) => {
     const stored = { ...session };
     delete stored._persistedImages;
+    delete stored._persistedReference;
+    delete stored.busy;
     stored.images = (session.images || []).map((image, index) => {
       if (!isEmbeddedImage(image)) return image;
       if (!('indexedDB' in window)) return '';
@@ -112,6 +173,18 @@ function persistSessions() {
       }
       return `${imageRefPrefix}${key}`;
     });
+    if (isEmbeddedImage(session.referenceImage)) {
+      if (!('indexedDB' in window)) {
+        stored.referenceImage = '';
+      } else {
+        const key = storedReferenceKey(session.id);
+        if (session._persistedReference !== session.referenceImage) {
+          session._persistedReference = session.referenceImage;
+          storeImageValue(key, session.referenceImage).catch((error) => console.warn('Failed to store reference image:', error));
+        }
+        stored.referenceImage = `${imageRefPrefix}${key}`;
+      }
+    }
     return stored;
   });
 
@@ -134,6 +207,10 @@ function isEmbeddedImage(value) {
 
 function storedImageKey(sessionId, index) {
   return `${sessionId}:${index}`;
+}
+
+function storedReferenceKey(sessionId) {
+  return `${sessionId}:reference`;
 }
 
 function openImageDb() {
@@ -196,6 +273,16 @@ async function hydrateStoredImages() {
       }
     }));
     session.images = images.filter(Boolean);
+
+    if (typeof session.referenceImage === 'string' && session.referenceImage.startsWith(imageRefPrefix)) {
+      try {
+        const value = await loadImageValue(session.referenceImage.slice(imageRefPrefix.length));
+        session.referenceImage = typeof value === 'string' ? value : '';
+        session._persistedReference = session.referenceImage;
+      } catch {
+        session.referenceImage = '';
+      }
+    }
   }));
 }
 
@@ -206,16 +293,18 @@ function persistApiKey(value) {
   updateSendState();
 }
 
-function createSession(prompt = '') {
-  const session = {
+function createSession(prompt = '', initial = {}) {
+  const now = new Date().toISOString();
+  const session = normalizeSession({
     id: uid(),
     title: prompt ? prompt.slice(0, 24) : '新建草稿',
     prompt,
     images: [],
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    settings: readSettings(),
-  };
+    createdAt: now,
+    updatedAt: now,
+    settings: defaultSettings(),
+    ...initial,
+  });
   state.sessions.unshift(session);
   state.activeId = session.id;
   persistSessions();
@@ -224,24 +313,36 @@ function createSession(prompt = '') {
   return session;
 }
 
+function updateSession(sessionId, patch, { moveToFront = false } = {}) {
+  const session = findSession(sessionId);
+  if (!session) return null;
+
+  Object.assign(session, patch, { updatedAt: new Date().toISOString() });
+  if (patch.prompt !== undefined) session.title = patch.prompt ? patch.prompt.slice(0, 24) : '新建草稿';
+  if (patch.settings) session.settings = normalizeSettings(patch.settings);
+  if (moveToFront) state.sessions = [session, ...state.sessions.filter((item) => item.id !== session.id)];
+  persistSessions();
+  return session;
+}
+
 function updateActiveSession(patch) {
   let session = activeSession();
   if (!session) session = createSession(patch.prompt || '');
-  Object.assign(session, patch, { updatedAt: new Date().toISOString() });
-  if (patch.prompt !== undefined) session.title = patch.prompt ? patch.prompt.slice(0, 24) : '新建草稿';
-  session.settings = readSettings();
-  state.sessions = [session, ...state.sessions.filter((item) => item.id !== session.id)];
-  state.activeId = session.id;
-  persistSessions();
+  return updateSession(session.id, {
+    settings: readSettings(),
+    ...patch,
+  }, { moveToFront: true });
 }
 
 function deleteSession(sessionId) {
   const index = state.sessions.findIndex((session) => session.id === sessionId);
   if (index < 0) return;
+  abortSessionRequest(sessionId);
   const [removed] = state.sessions.splice(index, 1);
   for (let imageIndex = 0; imageIndex < Math.max(4, removed.images?.length || 0); imageIndex += 1) {
     deleteImageValue(storedImageKey(sessionId, imageIndex)).catch(() => undefined);
   }
+  deleteImageValue(storedReferenceKey(sessionId)).catch(() => undefined);
   if (state.activeId === sessionId) {
     state.activeId = state.sessions[index]?.id || state.sessions[index - 1]?.id || null;
     applySessionToForm(activeSession());
@@ -252,16 +353,17 @@ function deleteSession(sessionId) {
 }
 
 function applySessionToForm(session) {
+  const settings = normalizeSettings(session?.settings);
   els.prompt.value = session?.prompt || '';
-  if (session?.settings) {
-    els.ratio.value = session.settings.ratio || '1:1';
-    els.size.value = normalizeQuality(session.settings.quality || session.settings.size || 'auto');
-    els.model.value = session.settings.model || defaultModel;
-    els.background.value = session.settings.background || 'auto';
-    els.format.value = session.settings.output_format || 'png';
-    els.count.value = session.settings.n || 1;
-  }
+  els.ratio.value = settings.ratio;
+  els.size.value = settings.quality;
+  els.model.value = settings.model;
+  els.background.value = settings.background;
+  els.format.value = settings.output_format;
+  els.count.value = settings.n;
+  els.referenceInput.value = '';
   reconcileModelSize();
+  updateReferencePreview(session);
   updateTags();
   updateSendState();
 }
@@ -297,6 +399,11 @@ function normalizeQuality(value) {
 }
 
 function render() {
+  const session = activeSession();
+  els.draftTitle.textContent = session?.title || '新建草稿';
+  els.draftSubtitle.textContent = session
+    ? `${session.statusText || '准备就绪'} · API Key 只保存在当前浏览器。`
+    : '输入提示词开始画图。API Key 只保存在当前浏览器。';
   renderSessions();
   renderStage();
   updateTags();
@@ -318,10 +425,11 @@ function renderSessions() {
   for (const session of state.sessions) {
     const card = document.createElement('div');
     card.className = `session-card${session.id === state.activeId ? ' active' : ''}`;
+    const sessionStatus = session.busy ? '生成中' : session.stageStatus?.kind === 'error' ? '生成失败' : '';
     card.innerHTML = `
       <button class="session-main" type="button">
         <strong>${escapeHtml(session.title)}</strong>
-        <span>${escapeHtml(session.prompt || '空提示词')}</span>
+        <span>${escapeHtml(session.prompt || '空提示词')}${sessionStatus ? ` · ${escapeHtml(sessionStatus)}` : ''}</span>
       </button>
       <button class="session-delete" type="button" title="删除会话" aria-label="删除 ${escapeHtml(session.title || '会话')}">×</button>`;
     card.querySelector('.session-main').addEventListener('click', () => {
@@ -341,7 +449,7 @@ function renderSessions() {
 function renderStage() {
   const session = activeSession();
   const images = session?.images || [];
-  const notice = state.stageStatus;
+  const notice = session?.stageStatus || null;
   const showNotice = Boolean(notice) || !images.length;
   els.emptyState.style.display = showNotice ? 'block' : 'none';
   els.emptyState.className = `empty-state ${notice?.kind || 'idle'}`;
@@ -375,49 +483,105 @@ function renderStageNotice(notice) {
     <p>${escapeHtml(view.message)}</p>`;
 }
 
-function setStageStatus(kind, title, message, icon = '✦') {
-  state.stageStatus = { kind, title, message, icon };
-  renderStage();
+function setSessionStageStatus(sessionId, kind, title, message, icon = '✦') {
+  const session = updateSession(sessionId, {
+    stageStatus: { kind, title, message, icon },
+    statusText: kind === 'loading' ? '生成中' : title,
+  });
+  if (session) render();
 }
 
-function clearStageStatus() {
-  state.stageStatus = null;
+function clearSessionStageStatus(sessionId, statusText) {
+  const session = findSession(sessionId);
+  if (!session) return;
+  updateSession(sessionId, {
+    stageStatus: null,
+    statusText: statusText || (session.images?.length ? '生成完成' : '准备就绪'),
+  });
 }
 
 function updateTags() {
+  const mode = activeSession()?.mode || 'generate';
   els.modelTag.textContent = els.model.value;
   els.ratioTag.textContent = labels.ratio[els.ratio.value] || els.ratio.value;
   els.sizeTag.textContent = ({ low: '低清晰度', medium: '中清晰度', high: '高清晰度', auto: '自动清晰度' })[normalizeQuality(els.size.value)] || '自动清晰度';
   els.bgTag.textContent = labels.bg[els.background.value] || els.background.value;
   els.fmtTag.textContent = labels.fmt[els.format.value] || els.format.value;
   els.countTag.textContent = String(Math.max(1, Math.min(4, Number(els.count.value || 1))));
-  els.modeLabel.textContent = state.mode === 'generate' ? '生成模式' : '编辑模式';
+  els.modeLabel.textContent = mode === 'generate' ? '生成模式' : '编辑模式';
+  els.generateModeBtn.classList.toggle('active', mode === 'generate');
+  els.editModeBtn.classList.toggle('active', mode === 'edit');
 }
 
 function updateSendState() {
   const hasPrompt = Boolean(els.prompt.value.trim());
-  els.sendBtn.disabled = state.busy || !hasPrompt;
+  const session = activeSession();
+  const busy = Boolean(session?.busy);
+  els.sendBtn.disabled = busy || !hasPrompt;
+  els.sendIcon.textContent = busy ? '…' : '✦';
+  els.sendText.textContent = busy ? '生成中' : '发送';
+  els.statusLine.textContent = session?.statusText || '准备就绪';
+}
+
+function startSessionRequest(sessionId) {
+  abortSessionRequest(sessionId);
+  const id = uid();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort(new DOMException('Image generation timed out', 'TimeoutError'));
+  }, imageRequestTimeoutMs);
+  const request = { id, controller, timeoutId };
+  sessionRequests.set(sessionId, request);
+  return request;
+}
+
+function isCurrentRequest(sessionId, requestId) {
+  return Boolean(findSession(sessionId) && sessionRequests.get(sessionId)?.id === requestId);
+}
+
+function finishSessionRequest(sessionId, requestId) {
+  const request = sessionRequests.get(sessionId);
+  if (!request || request.id !== requestId) return;
+  clearTimeout(request.timeoutId);
+  sessionRequests.delete(sessionId);
+}
+
+function abortSessionRequest(sessionId) {
+  const request = sessionRequests.get(sessionId);
+  if (!request) return;
+  clearTimeout(request.timeoutId);
+  sessionRequests.delete(sessionId);
+  request.controller.abort();
 }
 
 async function sendPrompt() {
   const prompt = els.prompt.value.trim();
   if (!prompt) return toast('先写提示词', 'error');
+  let session = activeSession() || createSession(prompt);
+  const sessionId = session.id;
   if (!state.apiKey.trim()) {
-    els.statusLine.textContent = '先填 API Key';
-    setStageStatus('error', '缺少 API Key', '请先在右侧输入 API Key，它只会保存在当前浏览器。', '!');
+    setSessionStageStatus(sessionId, 'error', '缺少 API Key', '请先在右侧输入 API Key，它只会保存在当前浏览器。', '!');
     return toast('先填 API Key', 'error');
   }
 
-  state.busy = true;
-  els.sendIcon.textContent = '…';
-  els.sendText.textContent = '生成中';
-  els.statusLine.textContent = '生成中';
-  setStageStatus('loading', '正在生成图片', '请求已提交到 HaHaCode 图片接口，复杂提示词或高分辨率可能需要几十秒。', '…');
-  updateSendState();
+  const settings = readSettings();
+  session = updateSession(sessionId, { prompt, settings }, { moveToFront: true });
+  const referenceImage = session.mode === 'edit' ? session.referenceImage : '';
+  const request = startSessionRequest(sessionId);
+  updateSession(sessionId, {
+    busy: true,
+    statusText: '生成中',
+    stageStatus: {
+      kind: 'loading',
+      title: '正在生成图片',
+      message: '请求已提交到 HaHaCode 图片接口，复杂提示词或高分辨率可能需要几十秒。',
+      icon: '…',
+    },
+  });
+  render();
 
   try {
-    updateActiveSession({ prompt });
-    const body = { prompt, ...readSettings(), reference_image: state.referenceImage || undefined };
+    const body = { prompt, ...settings, reference_image: referenceImage || undefined };
     const res = await fetch('/api/generate', {
       method: 'POST',
       headers: {
@@ -425,39 +589,58 @@ async function sendPrompt() {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(imageRequestTimeoutMs),
+      signal: request.controller.signal,
     });
     if (res.headers.get('Content-Type')?.includes('text/event-stream')) {
-      const data = await readImageStream(res, prompt);
-      clearStageStatus();
-      updateActiveSession({ prompt, images: data.images });
-      els.statusLine.textContent = '生成完成';
-      toast('图片生成完成');
+      const data = await readImageStream(res, {
+        sessionId,
+        requestId: request.id,
+        prompt,
+        format: settings.output_format,
+      });
+      if (!isCurrentRequest(sessionId, request.id)) return;
+      updateSession(sessionId, { prompt, images: data.images, stageStatus: null, statusText: '生成完成', busy: false });
+      render();
+      if (state.activeId === sessionId) toast('图片生成完成');
       return;
     }
     const data = await readApiResponse(res);
     if (!res.ok && data.detail) console.warn('Image API detail:', data.detail);
     if (!res.ok) throw new Error(formatApiError(res.status, data.error || data.message || '生成失败'));
-    clearStageStatus();
-    updateActiveSession({ prompt, images: data.images || [data.image].filter(Boolean) });
-    els.statusLine.textContent = '生成完成';
-    toast('图片生成完成');
+    if (!isCurrentRequest(sessionId, request.id)) return;
+    updateSession(sessionId, {
+      prompt,
+      images: data.images || [data.image].filter(Boolean),
+      stageStatus: null,
+      statusText: '生成完成',
+      busy: false,
+    });
+    render();
+    if (state.activeId === sessionId) toast('图片生成完成');
   } catch (error) {
-    const message = error?.name === 'TimeoutError'
+    if (!isCurrentRequest(sessionId, request.id)) return;
+    const reason = request.controller.signal.reason || error;
+    const message = reason?.name === 'TimeoutError'
       ? '等待已超过 5 分钟，生成任务可能仍在上游执行，请稍后查看任务状态。'
       : error instanceof Error ? error.message : String(error);
-    els.statusLine.textContent = '生成失败';
-    setStageStatus('error', '生成失败', message, '!');
-    toast(message, 'error');
+    updateSession(sessionId, {
+      busy: false,
+      statusText: '生成失败',
+      stageStatus: { kind: 'error', title: '生成失败', message, icon: '!' },
+    });
+    render();
+    if (state.activeId === sessionId) toast(message, 'error');
   } finally {
-    state.busy = false;
-    els.sendIcon.textContent = '✦';
-    els.sendText.textContent = '发送';
+    if (isCurrentRequest(sessionId, request.id)) {
+      updateSession(sessionId, { busy: false });
+      finishSessionRequest(sessionId, request.id);
+    }
     render();
   }
 }
 
-async function readImageStream(res, prompt) {
+async function readImageStream(res, context) {
+  const { sessionId, requestId, prompt, format } = context;
   if (!res.ok) {
     const data = await readApiResponse(res);
     throw new Error(formatApiError(res.status, data.error || data.message || '生成失败'));
@@ -472,6 +655,10 @@ async function readImageStream(res, prompt) {
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
+    if (!isCurrentRequest(sessionId, requestId)) {
+      await reader.cancel();
+      throw new DOMException('Session request was cancelled', 'AbortError');
+    }
     buffer += decoder.decode(value, { stream: true });
     const chunks = buffer.split(/\n\n+/);
     buffer = chunks.pop() || '';
@@ -481,26 +668,26 @@ async function readImageStream(res, prompt) {
       const data = parseJson(event.data);
       const type = data.type || event.event;
       if (type === 'status' || type === 'image_generation.started') {
-        setStageStatus('loading', '正在生成图片', data.message || '模型正在处理，请保持页面打开。', '…');
+        setSessionStageStatus(sessionId, 'loading', '正在生成图片', data.message || '模型正在处理，请保持页面打开。', '…');
       }
       if (type === 'image_generation.status') {
         const progress = Number(data.progress);
         const message = Number.isFinite(progress)
           ? `图片生成中，当前进度 ${Math.max(0, Math.min(100, progress))}%...`
           : '图片生成中，请保持页面打开。';
-        setStageStatus('loading', '正在生成图片', message, '…');
+        setSessionStageStatus(sessionId, 'loading', '正在生成图片', message, '…');
       }
       if ((type === 'partial' && data.image) || (type === 'image_generation.partial_image' && data.b64_json)) {
         const index = data.index ?? data.partial_image_index ?? 0;
-        images[index] = data.image || `data:image/${els.format.value};base64,${data.b64_json}`;
-        updateActiveSession({ prompt, images: images.filter(Boolean) });
-        setStageStatus('loading', '收到部分图片', '模型还在继续完善图片，请稍等最终结果。', '…');
+        images[index] = data.image || `data:image/${format};base64,${data.b64_json}`;
+        updateSession(sessionId, { prompt, images: images.filter(Boolean) });
+        setSessionStageStatus(sessionId, 'loading', '收到部分图片', '模型还在继续完善图片，请稍等最终结果。', '…');
       }
       if (type === 'done') {
         return { images: data.images || images.filter(Boolean) };
       }
       if (type === 'image_generation.completed') {
-        const completedImages = extractStreamImages(data);
+        const completedImages = extractStreamImages(data, format);
         if (completedImages.length) return { images: completedImages };
         throw new Error('上游返回了完成事件，但没有图片地址。');
       }
@@ -515,13 +702,13 @@ async function readImageStream(res, prompt) {
   throw new Error('图片生成流结束，但没有收到图片。');
 }
 
-function extractStreamImages(data) {
+function extractStreamImages(data, format) {
   const values = [data.url, data.image_url, data.image];
-  if (data.b64_json) values.push(`data:image/${els.format.value};base64,${data.b64_json}`);
+  if (data.b64_json) values.push(`data:image/${format};base64,${data.b64_json}`);
   for (const item of data.data || []) {
     if (item.url) values.push(item.url);
     if (item.image_url) values.push(item.image_url);
-    if (item.b64_json) values.push(`data:image/${els.format.value};base64,${item.b64_json}`);
+    if (item.b64_json) values.push(`data:image/${format};base64,${item.b64_json}`);
   }
   return values.filter((value, index, list) => Boolean(value) && list.indexOf(value) === index);
 }
@@ -555,6 +742,10 @@ async function readApiResponse(res) {
 
 function formatApiError(status, errorText) {
   const message = extractError(errorText);
+  if (/current account image benefits do not support the requested image parameters/i.test(message)) {
+    const requestId = message.match(/request id:\s*([^\s)]+)/i)?.[1];
+    return `当前上游账号暂不支持所选模型与图片参数组合。请尝试 1:1、自动清晰度，或切换模型后重试。${requestId ? `（request id: ${requestId}）` : ''}`;
+  }
   if (status === 504) {
     return '上游接口超时（504）：HaHaCode 或其后面的图片模型没有在网关等待时间内返回。建议先用自动清晰度、张数 1 重试，或稍后再试。';
   }
@@ -603,14 +794,15 @@ async function fileToDataUrl(file) {
   });
 }
 
-function updateReferencePreview(fileName = '') {
-  if (!state.referenceImage) {
+function updateReferencePreview(session = activeSession()) {
+  const referenceImage = session?.referenceImage || '';
+  if (!referenceImage) {
     els.referencePreview.innerHTML = '<span>参考图</span><button class="ghost-button" id="pickReferenceBtn" type="button">选择图片</button>';
   } else {
-    els.referencePreview.innerHTML = `<img src="${state.referenceImage}" alt="参考图" /><span>${escapeHtml(fileName || '已添加参考图')}</span><button class="ghost-button" id="clearReferenceBtn" type="button">移除</button>`;
+    els.referencePreview.innerHTML = `<img src="${referenceImage}" alt="参考图" /><span>${escapeHtml(session.referenceName || '已添加参考图')}</span><button class="ghost-button" id="clearReferenceBtn" type="button">移除</button>`;
   }
   bindReferenceButtons();
-  els.referenceBadge.textContent = state.referenceImage ? '已添加参考图' : '未添加参考图';
+  els.referenceBadge.textContent = referenceImage ? '已添加参考图' : '未添加参考图';
 }
 
 function bindReferenceButtons() {
@@ -618,9 +810,13 @@ function bindReferenceButtons() {
   if (pick) pick.addEventListener('click', () => els.referenceInput.click());
   const clear = $('clearReferenceBtn');
   if (clear) clear.addEventListener('click', () => {
-    state.referenceImage = '';
+    const session = activeSession();
+    if (!session) return;
+    deleteImageValue(storedReferenceKey(session.id)).catch(() => undefined);
+    updateSession(session.id, { referenceImage: '', referenceName: '', _persistedReference: '' });
     els.referenceInput.value = '';
-    updateReferencePreview();
+    updateReferencePreview(session);
+    render();
   });
 }
 
@@ -652,6 +848,7 @@ els.newSessionBtn.addEventListener('click', () => createSession());
 els.newSessionTopBtn.addEventListener('click', () => createSession());
 els.clearSessionsBtn.addEventListener('click', () => {
   if (!confirm('清空所有本地会话？')) return;
+  for (const sessionId of [...sessionRequests.keys()]) abortSessionRequest(sessionId);
   state.sessions = [];
   state.activeId = null;
   clearImageValues().catch(() => undefined);
@@ -660,7 +857,8 @@ els.clearSessionsBtn.addEventListener('click', () => {
   render();
 });
 els.prompt.addEventListener('input', () => {
-  if (state.stageStatus?.kind !== 'loading') clearStageStatus();
+  const session = activeSession();
+  if (session && session.stageStatus?.kind !== 'loading') clearSessionStageStatus(session.id);
   updateActiveSession({ prompt: els.prompt.value.trim() });
   render();
 });
@@ -679,21 +877,20 @@ els.toggleKeyBtn.addEventListener('click', () => {
   els.toggleKeyBtn.textContent = next === 'password' ? '显示' : '隐藏';
 });
 els.generateModeBtn.addEventListener('click', () => {
-  state.mode = 'generate';
-  els.generateModeBtn.classList.add('active');
-  els.editModeBtn.classList.remove('active');
+  const session = activeSession() || createSession();
+  updateSession(session.id, { mode: 'generate', settings: readSettings() }, { moveToFront: true });
   render();
 });
 els.editModeBtn.addEventListener('click', () => {
-  state.mode = 'edit';
-  els.editModeBtn.classList.add('active');
-  els.generateModeBtn.classList.remove('active');
-  els.referenceInput.click();
+  const session = activeSession() || createSession();
+  updateSession(session.id, { mode: 'edit', settings: readSettings() }, { moveToFront: true });
+  if (!session.referenceImage) els.referenceInput.click();
   render();
 });
 ['ratio', 'size', 'model', 'background', 'format', 'count'].forEach((id) => {
   $(id).addEventListener('change', () => {
-    if (state.stageStatus?.kind !== 'loading') clearStageStatus();
+    const session = activeSession();
+    if (session && session.stageStatus?.kind !== 'loading') clearSessionStageStatus(session.id);
     reconcileModelSize();
     updateActiveSession({ prompt: els.prompt.value.trim() });
     render();
@@ -702,22 +899,42 @@ els.editModeBtn.addEventListener('click', () => {
 els.referenceInput.addEventListener('change', async () => {
   const file = els.referenceInput.files?.[0];
   if (!file) return;
-  state.referenceImage = await fileToDataUrl(file);
-  state.mode = 'edit';
-  els.editModeBtn.classList.add('active');
-  els.generateModeBtn.classList.remove('active');
-  updateReferencePreview(file.name);
+  const session = activeSession() || createSession();
+  const referenceImage = await fileToDataUrl(file);
+  updateSession(session.id, {
+    referenceImage,
+    referenceName: file.name,
+    mode: 'edit',
+    settings: readSettings(),
+  }, { moveToFront: true });
+  updateReferencePreview(session);
   render();
 });
 els.clearPromptBtn.addEventListener('click', () => {
   els.prompt.value = '';
+  const session = activeSession();
+  if (session && session.stageStatus?.kind !== 'loading') clearSessionStageStatus(session.id);
   updateActiveSession({ prompt: '' });
   render();
 });
 els.duplicateBtn.addEventListener('click', () => {
   const session = activeSession();
   if (!session) return createSession();
-  const copy = { ...session, id: uid(), title: `${session.title} 副本`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), _persistedImages: {} };
+  const now = new Date().toISOString();
+  const copy = normalizeSession({
+    ...session,
+    id: uid(),
+    title: `${session.title} 副本`,
+    images: [...(session.images || [])],
+    settings: { ...session.settings },
+    stageStatus: null,
+    statusText: session.images?.length ? '生成完成' : '准备就绪',
+    busy: false,
+    createdAt: now,
+    updatedAt: now,
+    _persistedImages: {},
+    _persistedReference: '',
+  });
   state.sessions.unshift(copy);
   state.activeId = copy.id;
   persistSessions();

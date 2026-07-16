@@ -9,6 +9,7 @@ A lightweight AI image generation workspace built on Cloudflare Workers. It serv
 - Single-page image generation workspace
 - Local browser API key storage
 - Local browser session history
+- Per-session prompts, settings, modes, reference images, generation status, and results
 - Text-to-image and reference-image edit flow
 - OpenAI Image and HaHaCode Nana image model support
 - Responsive desktop/mobile layout
