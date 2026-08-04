@@ -651,6 +651,57 @@ async function readImageStream(res, context) {
   const images = [];
   let buffer = '';
 
+  const processChunk = (chunk) => {
+    const event = parseSseChunk(chunk);
+    if (!event.data || event.data === '[DONE]') return null;
+    const data = parseJson(event.data);
+    const type = data.type || event.event || data.object;
+
+    if (type === 'status' || type === 'image_generation.started') {
+      setSessionStageStatus(sessionId, 'loading', '正在生成图片', data.message || '模型正在处理，请保持页面打开。', '…');
+    }
+    if (type === 'image_generation.status') {
+      const progress = Number(data.progress);
+      const message = Number.isFinite(progress)
+        ? `图片生成中，当前进度 ${Math.max(0, Math.min(100, progress))}%...`
+        : '图片生成中，请保持页面打开。';
+      setSessionStageStatus(sessionId, 'loading', '正在生成图片', message, '…');
+    }
+    if (type === 'image.generation.chunk') {
+      const message = String(data.progress_text || '').trim() || '模型正在生成图片，请保持页面打开。';
+      setSessionStageStatus(sessionId, 'loading', '正在生成图片', message, '…');
+    }
+
+    const isPartial = type === 'partial'
+      || type === 'image_generation.partial_image'
+      || type === 'response.image_generation_call.partial_image';
+    const partialValue = data.image || data.b64_json || data.partial_image_b64;
+    if (isPartial && partialValue) {
+      const index = data.index ?? data.partial_image_index ?? 0;
+      images[index] = normalizeStreamImageValue(partialValue, format);
+      updateSession(sessionId, { prompt, images: images.filter(Boolean) });
+      setSessionStageStatus(sessionId, 'loading', '收到部分图片', '模型还在继续完善图片，请稍等最终结果。', '…');
+    }
+
+    const isCompleted = type === 'done'
+      || type === 'image_generation.completed'
+      || type === 'image.generation.result'
+      || type === 'response.output_item.done'
+      || type === 'response.completed';
+    if (isCompleted) {
+      const completedImages = extractStreamImages(data, format);
+      if (completedImages.length) return { images: completedImages, incomplete: false };
+      if (type === 'done' && images.length) return { images: images.filter(Boolean), incomplete: false };
+      if (type !== 'response.completed') throw new Error('上游返回了完成事件，但没有图片地址。');
+    }
+
+    if (type === 'error') {
+      if (data.detail) console.warn('Image stream detail:', data.detail);
+      throw new Error(data.error?.message || data.error || data.message || '图片生成失败');
+    }
+    return null;
+  };
+
   while (true) {
     let result;
     try {
@@ -669,42 +720,18 @@ async function readImageStream(res, context) {
       throw new DOMException('Session request was cancelled', 'AbortError');
     }
     buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split(/\n\n+/);
+    const chunks = buffer.split(/\r?\n\r?\n+/);
     buffer = chunks.pop() || '';
     for (const chunk of chunks) {
-      const event = parseSseChunk(chunk);
-      if (!event.data) continue;
-      const data = parseJson(event.data);
-      const type = data.type || event.event;
-      if (type === 'status' || type === 'image_generation.started') {
-        setSessionStageStatus(sessionId, 'loading', '正在生成图片', data.message || '模型正在处理，请保持页面打开。', '…');
-      }
-      if (type === 'image_generation.status') {
-        const progress = Number(data.progress);
-        const message = Number.isFinite(progress)
-          ? `图片生成中，当前进度 ${Math.max(0, Math.min(100, progress))}%...`
-          : '图片生成中，请保持页面打开。';
-        setSessionStageStatus(sessionId, 'loading', '正在生成图片', message, '…');
-      }
-      if ((type === 'partial' && data.image) || (type === 'image_generation.partial_image' && data.b64_json)) {
-        const index = data.index ?? data.partial_image_index ?? 0;
-        images[index] = data.image || `data:image/${format};base64,${data.b64_json}`;
-        updateSession(sessionId, { prompt, images: images.filter(Boolean) });
-        setSessionStageStatus(sessionId, 'loading', '收到部分图片', '模型还在继续完善图片，请稍等最终结果。', '…');
-      }
-      if (type === 'done') {
-        return { images: data.images || images.filter(Boolean), incomplete: false };
-      }
-      if (type === 'image_generation.completed') {
-        const completedImages = extractStreamImages(data, format);
-        if (completedImages.length) return { images: completedImages, incomplete: false };
-        throw new Error('上游返回了完成事件，但没有图片地址。');
-      }
-      if (type === 'error') {
-        if (data.detail) console.warn('Image stream detail:', data.detail);
-        throw new Error(data.error?.message || data.error || data.message || '图片生成失败');
-      }
+      const completed = processChunk(chunk);
+      if (completed) return completed;
     }
+  }
+
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    const completed = processChunk(buffer);
+    if (completed) return completed;
   }
 
   if (images.length) return { images: images.filter(Boolean), incomplete: true };
@@ -721,14 +748,38 @@ function formatRequestError(error, signal) {
 }
 
 function extractStreamImages(data, format) {
-  const values = [data.url, data.image_url, data.image];
-  if (data.b64_json) values.push(`data:image/${format};base64,${data.b64_json}`);
-  for (const item of data.data || []) {
-    if (item.url) values.push(item.url);
+  const values = [];
+  const collect = (item) => {
+    if (!item) return;
+    if (typeof item === 'string') {
+      values.push(normalizeStreamImageValue(item, format));
+      return;
+    }
+
+    const inlineValue = item.b64_json || item.partial_image_b64 || item.result;
+    if (inlineValue) values.push(normalizeStreamImageValue(inlineValue, item.output_format || format));
+    if (item.image) values.push(normalizeStreamImageValue(item.image, item.output_format || format));
     if (item.image_url) values.push(item.image_url);
-    if (item.b64_json) values.push(`data:image/${format};base64,${item.b64_json}`);
-  }
+    if (!inlineValue && item.url) values.push(item.url);
+    for (const content of item.content || []) collect(content);
+  };
+
+  collect(data);
+  for (const item of data.data || []) collect(item);
+  for (const item of data.images || []) collect(item);
+  for (const item of data.output || []) collect(item);
+  for (const item of data.response?.output || []) collect(item);
+  if (data.item) collect(data.item);
+
   return values.filter((value, index, list) => Boolean(value) && list.indexOf(value) === index);
+}
+
+function normalizeStreamImageValue(value, format) {
+  if (!value) return '';
+  if (value.startsWith('data:image/') || value.startsWith('http://') || value.startsWith('https://')) {
+    return value;
+  }
+  return `data:image/${format};base64,${value}`;
 }
 
 function parseSseChunk(chunk) {
